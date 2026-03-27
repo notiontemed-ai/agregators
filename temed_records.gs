@@ -325,7 +325,7 @@ function extractCouponDoctor_(info) {
     return '';
   }
 
-  return `${lastName} ${firstInitial}${middleInitial}`.trim();
+  return [lastName, firstInitial, middleInitial].filter(Boolean).join(' ');
 }
 
 function writeCouponErrors_(spreadsheet, errors) {
