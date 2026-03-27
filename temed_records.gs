@@ -1,8 +1,7 @@
 const REPORT_SPREADSHEET_ID = '1xjyk0eGgjDI2VLZpxDxGtJfQ26xU3SV9ULTRghjJLS8';
 const CLINIC_MAPPING_SHEET = 'Соответствие клиник';
-const WEEKLY_REPORT_SHEET = 'Онлайн записи (недели)';
-const MONTHLY_REPORT_SHEET = 'Онлайн записи (мес)';
-const RAW_REPORT_SHEET = 'Все онлайн записи';
+const CITY_MAPPING_SHEET = 'Соответствие городов';
+const RAW_REPORT_SHEET = 'Все записи';
 const MENU_NAME = 'TEMED';
 const MENU_ITEM_NAME = 'Обработать записи';
 
@@ -14,36 +13,52 @@ function onOpen() {
 }
 
 function processTemedRecords() {
+  const ui = SpreadsheetApp.getUi();
   const sourceSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   const reportSpreadsheet = SpreadsheetApp.openById(REPORT_SPREADSHEET_ID);
 
   const clinicMap = loadClinicMapping_(reportSpreadsheet);
+  const cityMap = loadCityMapping_(reportSpreadsheet);
   const sourceSheets = sourceSpreadsheet
     .getSheets()
     .filter((sheet) => /^(Онлайн-запись|Экспресс-запись)/i.test(sheet.getName()));
 
   if (sourceSheets.length === 0) {
-    SpreadsheetApp.getUi().alert('Листы для обработки не найдены.');
+    ui.alert('Листы для обработки не найдены.');
     return;
   }
 
   const allRows = [];
   sourceSheets.forEach((sheet) => {
-    allRows.push(...parseSourceSheet_(sheet, clinicMap));
+    allRows.push(...parseSourceSheet_(sheet, clinicMap, cityMap));
   });
 
   if (allRows.length === 0) {
-    SpreadsheetApp.getUi().alert('В подходящих листах нет строк с данными.');
+    ui.alert('В подходящих листах нет строк с данными.');
     return;
   }
 
+  const incomingDateKeys = collectDateKeys_(allRows);
+  if (hasExistingDates_(reportSpreadsheet, incomingDateKeys)) {
+    const button = ui.alert(
+      'Найдены существующие записи',
+      'На листе "Все записи" уже есть данные за даты из текущей загрузки. Перезаписать их?',
+      ui.ButtonSet.YES_NO
+    );
+
+    if (button !== ui.Button.YES) {
+      ui.alert('Обработка отменена пользователем. Данные не изменены.');
+      return;
+    }
+
+    deleteRowsByDates_(reportSpreadsheet, incomingDateKeys);
+  }
+
   appendRawRows_(reportSpreadsheet, allRows);
-  upsertAggregate_(reportSpreadsheet, WEEKLY_REPORT_SHEET, buildWeeklyRows_(allRows));
-  upsertAggregate_(reportSpreadsheet, MONTHLY_REPORT_SHEET, buildMonthlyRows_(allRows));
 
   sourceSheets.forEach((sheet) => sourceSpreadsheet.deleteSheet(sheet));
 
-  SpreadsheetApp.getUi().alert(
+  ui.alert(
     `Обработка завершена. Перенесено записей: ${allRows.length}. Удалено листов: ${sourceSheets.length}.`
   );
 }
@@ -82,14 +97,72 @@ function loadClinicMapping_(reportSpreadsheet) {
   return map;
 }
 
-function parseSourceSheet_(sheet, clinicMap) {
+function loadCityMapping_(reportSpreadsheet) {
+  const sheet = reportSpreadsheet.getSheetByName(CITY_MAPPING_SHEET);
+  if (!sheet) {
+    throw new Error(`Не найден лист "${CITY_MAPPING_SHEET}" в книге отчетов.`);
+  }
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) {
+    return {};
+  }
+
+  const header = values[0].map((value) => String(value || '').trim());
+  const cityIdx = header.indexOf('Город');
+  const titleIdx = header.indexOf('Заголовок в актах');
+
+  if (cityIdx === -1 || titleIdx === -1) {
+    throw new Error(
+      `На листе "${CITY_MAPPING_SHEET}" должны быть столбцы "Город" и "Заголовок в актах".`
+    );
+  }
+
+  const map = {};
+  for (let i = 1; i < values.length; i += 1) {
+    const row = values[i];
+    const city = String(row[cityIdx] || '').trim();
+    const title = String(row[titleIdx] || '').trim();
+
+    if (!city || !title) {
+      continue;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(map, title)) {
+      throw new Error(
+        `На листе "${CITY_MAPPING_SHEET}" найден дубликат заголовка "${title}" (строка ${i + 1}).`
+      );
+    }
+
+    map[title] = city;
+  }
+
+  return map;
+}
+
+function parseSourceSheet_(sheet, clinicMap, cityMap) {
   const values = sheet.getDataRange().getValues();
   if (values.length === 0) {
     return [];
   }
 
+  const sheetName = sheet.getName();
+  const isExpress = /^Экспресс-запись/i.test(sheetName);
   const title = String(values[0][0] || '').trim();
-  const clinic = clinicMap[title] || title;
+
+  let clinic = '';
+  let city = '';
+  if (isExpress) {
+    city = cityMap[title];
+    if (!city) {
+      throw new Error(
+        `Для листа "${sheetName}" не найден город: в "${CITY_MAPPING_SHEET}" отсутствует "Заголовок в актах" = "${title}".`
+      );
+    }
+  } else {
+    clinic = clinicMap[title] || title;
+  }
+
   const headerRowIndex = findTableHeaderRowIndex_(values);
 
   if (headerRowIndex === -1) {
@@ -131,6 +204,7 @@ function parseSourceSheet_(sheet, clinicMap) {
       date,
       doctor,
       clinic,
+      city,
       phone,
       price,
     });
@@ -207,113 +281,69 @@ function appendRawRows_(reportSpreadsheet, rows) {
     throw new Error(`Не найден лист "${RAW_REPORT_SHEET}" в книге отчетов.`);
   }
 
-  const values = rows.map((row) => [row.date, row.doctor, row.clinic, row.phone, row.price]);
+  const values = rows.map((row) => [row.date, row.doctor, row.clinic, row.city, row.phone, row.price]);
   const startRow = sheet.getLastRow() + 1;
   sheet.getRange(startRow, 1, values.length, values[0].length).setValues(values);
 }
 
-function buildWeeklyRows_(rows) {
-  const map = {};
-
+function collectDateKeys_(rows) {
+  const keys = {};
   rows.forEach((row) => {
-    const period = getWeekCode_(row.date);
-    const key = `${period}|${row.doctor}`;
-
-    if (!map[key]) {
-      map[key] = { period, doctor: row.doctor, count: 0, amount: 0 };
-    }
-
-    map[key].count += 1;
-    map[key].amount += row.price;
+    keys[formatDateKey_(row.date)] = true;
   });
-
-  return Object.values(map).map((item) => [item.period, item.doctor, item.count, item.amount]);
+  return keys;
 }
 
-function buildMonthlyRows_(rows) {
-  const map = {};
+function hasExistingDates_(reportSpreadsheet, dateKeys) {
+  const sheet = reportSpreadsheet.getSheetByName(RAW_REPORT_SHEET);
+  if (!sheet) {
+    throw new Error(`Не найден лист "${RAW_REPORT_SHEET}" в книге отчетов.`);
+  }
 
-  rows.forEach((row) => {
-    const period = getMonthCode_(row.date);
-    const key = `${period}|${row.doctor}`;
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    return false;
+  }
 
-    if (!map[key]) {
-      map[key] = { period, doctor: row.doctor, count: 0, amount: 0 };
+  const dates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  for (let i = 0; i < dates.length; i += 1) {
+    const existingDate = toDate_(dates[i][0]);
+    if (!existingDate) {
+      continue;
     }
 
-    map[key].count += 1;
-    map[key].amount += row.price;
-  });
+    if (dateKeys[formatDateKey_(existingDate)]) {
+      return true;
+    }
+  }
 
-  return Object.values(map).map((item) => [item.period, item.doctor, item.count, item.amount]);
+  return false;
 }
 
-function upsertAggregate_(reportSpreadsheet, sheetName, rows) {
-  if (rows.length === 0) {
+function deleteRowsByDates_(reportSpreadsheet, dateKeys) {
+  const sheet = reportSpreadsheet.getSheetByName(RAW_REPORT_SHEET);
+  if (!sheet) {
+    throw new Error(`Не найден лист "${RAW_REPORT_SHEET}" в книге отчетов.`);
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
     return;
   }
 
-  const sheet = reportSpreadsheet.getSheetByName(sheetName);
-  if (!sheet) {
-    throw new Error(`Не найден лист "${sheetName}" в книге отчетов.`);
-  }
-
-  const existingRange = sheet.getDataRange();
-  const existingValues = existingRange.getValues();
-  const indexByKey = {};
-
-  for (let i = 1; i < existingValues.length; i += 1) {
-    const row = existingValues[i];
-    const period = row[0];
-    const doctor = String(row[1] || '').trim();
-    if (period && doctor) {
-      indexByKey[`${period}|${doctor}`] = i + 1;
-    }
-  }
-
-  const toAppend = [];
-  rows.forEach((row) => {
-    const key = `${row[0]}|${String(row[1] || '').trim()}`;
-    const existingRowNumber = indexByKey[key];
-
-    if (existingRowNumber) {
-      const currentCount = Number(sheet.getRange(existingRowNumber, 3).getValue()) || 0;
-      const currentAmount = Number(sheet.getRange(existingRowNumber, 4).getValue()) || 0;
-      sheet.getRange(existingRowNumber, 3, 1, 2).setValues([[currentCount + row[2], currentAmount + row[3]]]);
-      return;
+  const dates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  for (let i = dates.length - 1; i >= 0; i -= 1) {
+    const existingDate = toDate_(dates[i][0]);
+    if (!existingDate) {
+      continue;
     }
 
-    toAppend.push(row);
-  });
-
-  if (toAppend.length > 0) {
-    const startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
+    if (dateKeys[formatDateKey_(existingDate)]) {
+      sheet.deleteRow(i + 2);
+    }
   }
 }
 
-function getWeekCode_(date) {
-  const year = date.getFullYear();
-  const shortYear = year % 100;
-  const firstDay = new Date(year, 0, 1);
-  const diffDays = Math.floor((date - firstDay) / 86400000);
-  const jan1MondayBasedDay = (firstDay.getDay() + 6) % 7;
-  const daysToFirstMonday = (7 - jan1MondayBasedDay) % 7;
-
-  let week;
-  if (daysToFirstMonday === 0) {
-    week = 1 + Math.floor(diffDays / 7);
-  } else if (diffDays < daysToFirstMonday) {
-    week = 1;
-  } else {
-    week = 2 + Math.floor((diffDays - daysToFirstMonday) / 7);
-  }
-
-  return shortYear * 1000 + week;
-}
-
-function getMonthCode_(date) {
-  const year = date.getFullYear() % 100;
-  const month = date.getMonth() + 1;
-  return year * 100 + month;
+function formatDateKey_(date) {
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
 }
