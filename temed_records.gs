@@ -2,13 +2,18 @@ const REPORT_SPREADSHEET_ID = '1xjyk0eGgjDI2VLZpxDxGtJfQ26xU3SV9ULTRghjJLS8';
 const CLINIC_MAPPING_SHEET = 'Соответствие клиник';
 const CITY_MAPPING_SHEET = 'Соответствие городов';
 const RAW_REPORT_SHEET = 'Все записи';
+const COUPON_REPORT_SHEET = 'Все купоны';
+const COUPON_SOURCE_SHEET = 'Клубные купоны';
+const ERROR_SHEET_NAME = 'Ошибки купонов';
 const MENU_NAME = 'TEMED';
 const MENU_ITEM_NAME = 'Обработать записи';
+const MENU_COUPON_ITEM_NAME = 'Обработать купоны';
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu(MENU_NAME)
     .addItem(MENU_ITEM_NAME, 'processTemedRecords')
+    .addItem(MENU_COUPON_ITEM_NAME, 'processTemedCoupons')
     .addToUi();
 }
 
@@ -63,7 +68,57 @@ function processTemedRecords() {
   );
 }
 
-function loadClinicMapping_(reportSpreadsheet) {
+function processTemedCoupons() {
+  const ui = SpreadsheetApp.getUi();
+  const sourceSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const reportSpreadsheet = SpreadsheetApp.openById(REPORT_SPREADSHEET_ID);
+  const sourceSheet = sourceSpreadsheet.getSheetByName(COUPON_SOURCE_SHEET);
+
+  if (!sourceSheet) {
+    ui.alert(`Лист "${COUPON_SOURCE_SHEET}" не найден.`);
+    return;
+  }
+
+  const clinicMap = loadClinicMapping_(reportSpreadsheet, 'Заголовок купоны');
+  const parseResult = parseCouponSheet_(sourceSheet, clinicMap);
+
+  if (parseResult.errors.length > 0) {
+    writeCouponErrors_(sourceSpreadsheet, parseResult.errors);
+    ui.alert(
+      'Обработка купонов остановлена из-за ошибок. Подробности записаны на лист "Ошибки купонов".'
+    );
+    return;
+  }
+
+  if (parseResult.rows.length === 0) {
+    ui.alert('На листе "Клубные купоны" не найдено строк для переноса.');
+    return;
+  }
+
+  const incomingDateKeys = collectDateKeysByField_(parseResult.rows, 'recordDate');
+  if (hasExistingCouponDates_(reportSpreadsheet, incomingDateKeys)) {
+    const button = ui.alert(
+      'Найдены существующие купоны',
+      'На листе "Все купоны" уже есть данные за даты записи из текущей загрузки. Перезаписать их?',
+      ui.ButtonSet.YES_NO
+    );
+
+    if (button !== ui.Button.YES) {
+      ui.alert('Обработка отменена пользователем. Данные не изменены.');
+      return;
+    }
+
+    deleteCouponRowsByRecordDates_(reportSpreadsheet, incomingDateKeys);
+  }
+
+  appendCouponRows_(reportSpreadsheet, parseResult.rows);
+  clearCouponErrors_(sourceSpreadsheet);
+  sourceSpreadsheet.deleteSheet(sourceSheet);
+
+  ui.alert(`Обработка купонов завершена. Перенесено строк: ${parseResult.rows.length}.`);
+}
+
+function loadClinicMapping_(reportSpreadsheet, titleColumnName) {
   const sheet = reportSpreadsheet.getSheetByName(CLINIC_MAPPING_SHEET);
   if (!sheet) {
     throw new Error(`Не найден лист "${CLINIC_MAPPING_SHEET}" в книге отчетов.`);
@@ -76,11 +131,12 @@ function loadClinicMapping_(reportSpreadsheet) {
 
   const header = values[0].map((value) => String(value || '').trim());
   const clinicIdx = header.indexOf('Клиника');
-  const titleIdx = header.indexOf('Заголовок в актах');
+  const titleIdx = header.indexOf(titleColumnName || 'Заголовок в актах');
 
   if (clinicIdx === -1 || titleIdx === -1) {
     throw new Error(
-      `На листе "${CLINIC_MAPPING_SHEET}" должны быть столбцы "Клиника" и "Заголовок в актах".`
+      `На листе "${CLINIC_MAPPING_SHEET}" должны быть столбцы "Клиника" и "${titleColumnName ||
+        'Заголовок в актах'}".`
     );
   }
 
@@ -95,6 +151,257 @@ function loadClinicMapping_(reportSpreadsheet) {
   }
 
   return map;
+}
+
+function parseCouponSheet_(sheet, clinicMap) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length === 0) {
+    return { rows: [], errors: [] };
+  }
+
+  const headerRowIndex = findCouponHeaderRowIndex_(values);
+  if (headerRowIndex === -1) {
+    throw new Error(
+      'На листе "Клубные купоны" не найдена строка заголовков таблицы с колонками купонов.'
+    );
+  }
+
+  const headerRow = values[headerRowIndex].map((cell) => normalizeHeader_(cell));
+  const phoneIdx = headerRow.indexOf('телефон пациента');
+  const recordDateIdx = headerRow.indexOf('дата записи');
+  const appointmentDateIdx = headerRow.indexOf('дата приема');
+  const infoIdx = headerRow.indexOf('информация');
+  const statusIdx = headerRow.indexOf('статус');
+  const priceIdx = headerRow.findIndex((name) => /^стоимость купона/.test(name));
+
+  if ([phoneIdx, recordDateIdx, appointmentDateIdx, infoIdx, statusIdx, priceIdx].some((idx) => idx === -1)) {
+    throw new Error(
+      'На листе "Клубные купоны" не найдены обязательные столбцы: Телефон пациента, Дата записи, Дата приема, Информация, Статус, Стоимость купона.'
+    );
+  }
+
+  const rows = [];
+  const errors = [];
+  let currentClinic = '';
+
+  for (let i = headerRowIndex + 1; i < values.length; i += 1) {
+    const row = values[i];
+    const rowNum = i + 1;
+    const recordDate = toDate_(row[recordDateIdx]);
+    const appointmentDate = toDate_(row[appointmentDateIdx]);
+    const info = String(row[infoIdx] || '').trim();
+    const phone = String(row[phoneIdx] || '').trim();
+    const status = String(row[statusIdx] || '').trim();
+    const price = toNumber_(row[priceIdx]);
+    const firstCell = String(row[0] || '').trim();
+
+    if (!recordDate && !appointmentDate && !info && !phone && !status && price === 0 && !firstCell) {
+      continue;
+    }
+
+    if (!recordDate && !appointmentDate && !info && !phone && !status && price === 0) {
+      if (/^сумма /i.test(firstCell)) {
+        continue;
+      }
+
+      currentClinic = clinicMap[firstCell] || '';
+      if (!currentClinic) {
+        errors.push(
+          `Строка ${rowNum}: не найдено соответствие клиники для заголовка "${firstCell}" (колонка "Заголовок купоны").`
+        );
+      }
+      continue;
+    }
+
+    if (!recordDate && !appointmentDate && !info && !phone && !status && price !== 0) {
+      continue;
+    }
+
+    if (!currentClinic) {
+      errors.push(`Строка ${rowNum}: не определена клиника для строки купона.`);
+      continue;
+    }
+
+    if (!recordDate) {
+      errors.push(`Строка ${rowNum}: не распознана дата записи.`);
+      continue;
+    }
+
+    if (!appointmentDate) {
+      errors.push(`Строка ${rowNum}: не распознана дата приема.`);
+      continue;
+    }
+
+    const doctor = extractCouponDoctor_(info);
+    if (!doctor) {
+      errors.push(`Строка ${rowNum}: не удалось выделить врача из поля "Информация" ("${info}").`);
+      continue;
+    }
+
+    rows.push({
+      clinic: currentClinic,
+      recordDate,
+      appointmentDate,
+      doctor,
+      status,
+      price,
+      phone,
+    });
+  }
+
+  return { rows, errors };
+}
+
+function findCouponHeaderRowIndex_(values) {
+  for (let i = 0; i < values.length; i += 1) {
+    const row = values[i].map((cell) => normalizeHeader_(cell));
+    if (
+      row.includes('телефон пациента') &&
+      row.includes('дата записи') &&
+      row.includes('дата приема') &&
+      row.includes('информация') &&
+      row.includes('статус') &&
+      row.some((name) => /^стоимость купона/.test(name))
+    ) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+function extractCouponDoctor_(info) {
+  const text = String(info || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  const withoutSpec = text.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  const parts = withoutSpec.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) {
+    return '';
+  }
+
+  const lastName = parts[0];
+  const firstInitial = parts[1] ? `${parts[1].charAt(0).toUpperCase()}.` : '';
+  const middleInitial = parts[2] ? `${parts[2].charAt(0).toUpperCase()}.` : '';
+
+  if (!firstInitial) {
+    return '';
+  }
+
+  return `${lastName} ${firstInitial}${middleInitial}`.trim();
+}
+
+function writeCouponErrors_(spreadsheet, errors) {
+  let sheet = spreadsheet.getSheetByName(ERROR_SHEET_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(ERROR_SHEET_NAME);
+  } else {
+    sheet.clearContents();
+  }
+
+  const rows = [['Ошибка'], ...errors.map((errorText) => [errorText])];
+  sheet.getRange(1, 1, rows.length, 1).setValues(rows);
+  sheet.autoResizeColumn(1);
+}
+
+function clearCouponErrors_(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName(ERROR_SHEET_NAME);
+  if (sheet) {
+    spreadsheet.deleteSheet(sheet);
+  }
+}
+
+function appendCouponRows_(reportSpreadsheet, rows) {
+  const sheet = reportSpreadsheet.getSheetByName(COUPON_REPORT_SHEET);
+  if (!sheet) {
+    throw new Error(`Не найден лист "${COUPON_REPORT_SHEET}" в книге отчетов.`);
+  }
+
+  const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+    .map((cell) => normalizeHeader_(cell));
+  const rowValues = rows.map((row) =>
+    header.map((name) => {
+      if (name === 'дата записи') return row.recordDate;
+      if (name === 'дата приема') return row.appointmentDate;
+      if (name === 'врач') return row.doctor;
+      if (name === 'статус') return row.status;
+      if (/^стоимость купона/.test(name)) return row.price;
+      if (name === 'телефон пациента') return row.phone;
+      if (name === 'клиника') return row.clinic;
+      return '';
+    })
+  );
+
+  const startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 1, rowValues.length, rowValues[0].length).setValues(rowValues);
+}
+
+function collectDateKeysByField_(rows, fieldName) {
+  const keys = {};
+  rows.forEach((row) => {
+    if (row[fieldName]) {
+      keys[formatDateKey_(row[fieldName])] = true;
+    }
+  });
+  return keys;
+}
+
+function hasExistingCouponDates_(reportSpreadsheet, dateKeys) {
+  const sheet = reportSpreadsheet.getSheetByName(COUPON_REPORT_SHEET);
+  if (!sheet) {
+    throw new Error(`Не найден лист "${COUPON_REPORT_SHEET}" в книге отчетов.`);
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    return false;
+  }
+
+  const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+    .map((cell) => normalizeHeader_(cell));
+  const recordDateIdx = header.indexOf('дата записи');
+  if (recordDateIdx === -1) {
+    throw new Error(`На листе "${COUPON_REPORT_SHEET}" не найден столбец "Дата записи".`);
+  }
+
+  const dates = sheet.getRange(2, recordDateIdx + 1, lastRow - 1, 1).getValues();
+  for (let i = 0; i < dates.length; i += 1) {
+    const existingDate = toDate_(dates[i][0]);
+    if (existingDate && dateKeys[formatDateKey_(existingDate)]) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function deleteCouponRowsByRecordDates_(reportSpreadsheet, dateKeys) {
+  const sheet = reportSpreadsheet.getSheetByName(COUPON_REPORT_SHEET);
+  if (!sheet) {
+    throw new Error(`Не найден лист "${COUPON_REPORT_SHEET}" в книге отчетов.`);
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    return;
+  }
+
+  const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+    .map((cell) => normalizeHeader_(cell));
+  const recordDateIdx = header.indexOf('дата записи');
+  if (recordDateIdx === -1) {
+    throw new Error(`На листе "${COUPON_REPORT_SHEET}" не найден столбец "Дата записи".`);
+  }
+
+  const dates = sheet.getRange(2, recordDateIdx + 1, lastRow - 1, 1).getValues();
+  for (let i = dates.length - 1; i >= 0; i -= 1) {
+    const existingDate = toDate_(dates[i][0]);
+    if (existingDate && dateKeys[formatDateKey_(existingDate)]) {
+      sheet.deleteRow(i + 2);
+    }
+  }
 }
 
 function loadCityMapping_(reportSpreadsheet) {
