@@ -254,7 +254,26 @@ function toDate_(value) {
     return null;
   }
 
-  const parsed = new Date(value);
+  const text = String(value).trim();
+  const ruDateMatch = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (ruDateMatch) {
+    const day = Number(ruDateMatch[1]);
+    const month = Number(ruDateMatch[2]);
+    const year = Number(ruDateMatch[3]);
+    const parsedRu = new Date(year, month - 1, day);
+
+    if (
+      parsedRu.getFullYear() === year &&
+      parsedRu.getMonth() === month - 1 &&
+      parsedRu.getDate() === day
+    ) {
+      return parsedRu;
+    }
+
+    return null;
+  }
+
+  const parsed = new Date(text);
   if (Number.isNaN(parsed.getTime())) {
     return null;
   }
@@ -284,6 +303,12 @@ function appendRawRows_(reportSpreadsheet, rows) {
   const values = rows.map((row) => [row.date, row.doctor, row.clinic, row.city, row.phone, row.price]);
   const startRow = sheet.getLastRow() + 1;
   sheet.getRange(startRow, 1, values.length, values[0].length).setValues(values);
+
+  const totalRows = sheet.getLastRow();
+  if (totalRows > 1) {
+    sheet.getRange(2, 1, totalRows - 1, 6).sort({ column: 1, ascending: true });
+    sheet.getRange(2, 1, totalRows - 1, 1).setNumberFormat('dd.mm.yyyy');
+  }
 }
 
 function collectDateKeys_(rows) {
