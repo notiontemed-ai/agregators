@@ -187,13 +187,35 @@ function parseCouponSheet_(sheet, clinicMap) {
   for (let i = headerRowIndex + 1; i < values.length; i += 1) {
     const row = values[i];
     const rowNum = i + 1;
+    const firstCellRaw = row[0];
+    const firstCell = String(firstCellRaw || '').trim();
+    const isDataRow = isCouponDataRow_(firstCellRaw);
     const recordDate = toDate_(row[recordDateIdx]);
     const appointmentDate = toDate_(row[appointmentDateIdx]);
     const info = String(row[infoIdx] || '').trim();
     const phone = String(row[phoneIdx] || '').trim();
     const status = String(row[statusIdx] || '').trim();
     const price = toNumber_(row[priceIdx]);
-    const firstCell = String(row[0] || '').trim();
+
+    if (!isDataRow) {
+      if (!recordDate && !appointmentDate && !info && !phone && !status && price === 0 && !firstCell) {
+        continue;
+      }
+
+      if (/^сумма /i.test(firstCell)) {
+        continue;
+      }
+
+      if (!recordDate && !appointmentDate && !info && !phone && !status && price === 0) {
+        currentClinic = clinicMap[firstCell] || '';
+        if (!currentClinic) {
+          errors.push(
+            `Строка ${rowNum}: не найдено соответствие клиники для заголовка "${firstCell}" (колонка "Заголовок купоны").`
+          );
+        }
+      }
+      continue;
+    }
 
     if (!recordDate && !appointmentDate && !info && !phone && !status && price === 0 && !firstCell) {
       continue;
@@ -250,6 +272,19 @@ function parseCouponSheet_(sheet, clinicMap) {
   }
 
   return { rows, errors };
+}
+
+function isCouponDataRow_(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value);
+  }
+
+  const text = String(value || '').trim();
+  if (!text) {
+    return false;
+  }
+
+  return /^\d+$/.test(text);
 }
 
 function findCouponHeaderRowIndex_(values) {
