@@ -88,6 +88,7 @@ function updateRatings_(aggregatorKeys) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var logSheet = getOrCreateLogSheet_();
   var logs = [];
+  var errors = [];
   var now = new Date();
 
   addLog_(logs, 'INFO', 'Старт обновления рейтингов', {
@@ -200,16 +201,36 @@ function updateRatings_(aggregatorKeys) {
             clinics: parsed.clinics || ''
           });
         } catch (error) {
-          targetRow[agg.ratingHeader] = '';
-          targetRow[agg.reviewsHeader] = '';
-          targetRow[agg.clinicsHeader] = '';
+          var errorMessage = error && error.message ? error.message : String(error);
+          var isHttp403 = /HTTP status:\s*403/i.test(errorMessage);
+          var hasTodayValues = Boolean(existingTodayRow);
+
+          if (isHttp403 && hasTodayValues) {
+            targetRow[agg.ratingHeader] = existingTodayRow.rowObj[agg.ratingHeader];
+            targetRow[agg.reviewsHeader] = existingTodayRow.rowObj[agg.reviewsHeader];
+            targetRow[agg.clinicsHeader] = existingTodayRow.rowObj[agg.clinicsHeader];
+          } else {
+            targetRow[agg.ratingHeader] = '';
+            targetRow[agg.reviewsHeader] = '';
+            targetRow[agg.clinicsHeader] = '';
+          }
 
           addLog_(logs, 'ERROR', 'Ошибка обработки ссылки', {
             row: rowNumber,
             doctor: doctorName,
             aggregator: agg.title,
             url: url,
-            error: error && error.message ? error.message : String(error)
+            error: errorMessage,
+            oldValuesKept: isHttp403 && hasTodayValues
+          });
+
+          errors.push({
+            row: rowNumber,
+            doctor: doctorName,
+            aggregator: agg.title,
+            url: url,
+            message: errorMessage,
+            oldValuesKept: isHttp403 && hasTodayValues
           });
         }
       }
@@ -238,7 +259,50 @@ function updateRatings_(aggregatorKeys) {
     throw error;
   } finally {
     flushLogs_(logSheet, logs);
+    showErrorsModal_(errors);
   }
+}
+
+function showErrorsModal_(errors) {
+  if (!errors || errors.length === 0) {
+    return;
+  }
+
+  var lines = ['Во время обновления возникли ошибки (' + errors.length + '):', ''];
+
+  for (var i = 0; i < errors.length; i++) {
+    var item = errors[i];
+    var suffix = item.oldValuesKept
+      ? ' (HTTP 403: сохранены значения за текущую дату)'
+      : '';
+
+    lines.push(
+      [
+        i + 1 + '.',
+        'Строка ' + item.row + ',',
+        'врач: ' + item.doctor + ',',
+        'агрегатор: ' + item.aggregator + ',',
+        'ошибка: ' + item.message + suffix
+      ].join(' ')
+    );
+  }
+
+  var message = lines.join('\n');
+  var html = HtmlService
+    .createHtmlOutput('<pre style="white-space: pre-wrap; font-family: Arial, sans-serif;">' + escapeHtml_(message) + '</pre>')
+    .setWidth(800)
+    .setHeight(500);
+
+  SpreadsheetApp.getUi().showModalDialog(html, 'Ошибки обновления рейтингов');
+}
+
+function escapeHtml_(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 /**
