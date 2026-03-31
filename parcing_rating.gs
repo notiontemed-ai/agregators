@@ -313,7 +313,10 @@ function extractPdReviews_(html) {
 }
 
 /**
- * Клиники ПД: name из блоков lpu.
+ * Клиники ПД:
+ * 1) SSR-атрибут :lpu-address-list;
+ * 2) fallback: data-review-power-info-open;
+ * 3) fallback: адреса в отзывах.
  */
 function extractPdClinics_(html) {
   if (!html) {
@@ -321,12 +324,75 @@ function extractPdClinics_(html) {
   }
 
   var matches = [];
-  var regex = /lpu\s*:\s*\{[\s\S]*?name\s*:\s*'([^']+)'/gi;
   var match;
 
-  while ((match = regex.exec(html)) !== null) {
-    if (match[1]) {
-      matches.push(cleanExtractedText_(match[1]));
+  // 1) Основной источник: SSR-атрибут :lpu-address-list="..."
+  var lpuAttrMatch = html.match(/:lpu-address-list\s*=\s*"([^"]*)"/i);
+  if (lpuAttrMatch && lpuAttrMatch[1]) {
+    var decodedAttr = decodeHtmlEntities_(lpuAttrMatch[1]);
+    var parsed = null;
+
+    try {
+      parsed = JSON.parse(cleanJsonText_(decodedAttr));
+    } catch (error) {
+      parsed = null;
+    }
+
+    if (parsed && parsed.length) {
+      for (var i = 0; i < parsed.length; i++) {
+        var item = parsed[i];
+        if (item && item.lpu && item.lpu.name) {
+          matches.push(cleanExtractedText_(item.lpu.name));
+        }
+      }
+    } else {
+      // fallback-парсинг по lpu -> name, если JSON.parse не сработал
+      var lpuNameRegex = /"lpu"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([^"]+)"/gi;
+      while ((match = lpuNameRegex.exec(decodedAttr)) !== null) {
+        if (match[1]) {
+          matches.push(cleanJsonText_(match[1]));
+        }
+      }
+    }
+
+    var lpuResult = uniqueJoin_(matches);
+    if (lpuResult) {
+      return lpuResult;
+    }
+  }
+
+  // 2) Fallback: data-review-power-info-open="..."
+  matches = [];
+  var reviewInfoRegex = /data-review-power-info-open\s*=\s*"([^"]*)"/gi;
+  while ((match = reviewInfoRegex.exec(html)) !== null) {
+    var decodedReviewInfo = decodeHtmlEntities_(match[1]);
+    var reviewNameRegex = /name\s*:\s*'([^']+)'/gi;
+    var nameMatch;
+
+    while ((nameMatch = reviewNameRegex.exec(decodedReviewInfo)) !== null) {
+      if (nameMatch[1]) {
+        matches.push(cleanExtractedText_(nameMatch[1]));
+      }
+    }
+  }
+
+  var reviewInfoResult = uniqueJoin_(matches);
+  if (reviewInfoResult) {
+    return reviewInfoResult;
+  }
+
+  // 3) Fallback: блоки адресов отзывов class="b-review-card__address"
+  matches = [];
+  var addressRegex = /<[^>]*class="[^"]*b-review-card__address[^"]*"[^>]*>([\s\S]*?)<\/[^>]+>/gi;
+  while ((match = addressRegex.exec(html)) !== null) {
+    if (!match[1]) {
+      continue;
+    }
+
+    var addressText = cleanExtractedText_(match[1]);
+    var clinicName = normalizeText_(addressText.split(' - ')[0]);
+    if (clinicName) {
+      matches.push(clinicName);
     }
   }
 
@@ -507,21 +573,6 @@ function cleanJsonText_(value) {
   );
 }
 
-/**
- * Очистка текста, извлеченного из JSON.
- */
-function cleanJsonText_(value) {
-  return normalizeText_(
-    String(value || '')
-      .replace(/\\"/g, '"')
-      .replace(/\\\\/g, '\\')
-      .replace(/\\u003c/gi, '<')
-      .replace(/\\u003e/gi, '>')
-      .replace(/\\u0026quot;/gi, '"')
-      .replace(/\\u0026amp;/gi, '&')
-      .replace(/\\u002F/gi, '/')
-  );
-}
 /* =========================
    Общие утилиты
    ========================= */
