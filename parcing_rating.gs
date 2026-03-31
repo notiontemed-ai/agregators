@@ -4,25 +4,29 @@
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('TEMED')
-    .addItem('Обновить рейтинги (ПД)', 'parseRatingsFromLinks')
+    .addItem('Обновить рейтинги и отзывы (ПД)', 'parseRatingsFromLinks')
     .addToUi();
 }
 
 /**
- * Основная функция: обновляет рейтинги по ссылкам на активном листе.
+ * Основная функция: обновляет рейтинг и количество отзывов по ссылкам на активном листе.
  */
 function parseRatingsFromLinks() {
   var sheet = SpreadsheetApp.getActiveSheet();
   var logSheet = getOrCreateLogSheet_();
   var logs = [];
-  addLog_(logs, 'INFO', 'Старт обновления рейтингов', {
+
+  addLog_(logs, 'INFO', 'Старт обновления рейтингов и отзывов', {
     sheet: sheet.getName()
   });
+
   try {
-    var headerIndexes = getHeaderIndexes_(sheet, ['Ссылка', 'Рейтинг']);
+    var headerIndexes = getHeaderIndexes_(sheet, ['Ссылка', 'Рейтинг', 'Отзывы']);
+
     addLog_(logs, 'INFO', 'Колонки найдены', {
       linkColumn: headerIndexes['Ссылка'],
-      ratingColumn: headerIndexes['Рейтинг']
+      ratingColumn: headerIndexes['Рейтинг'],
+      reviewsColumn: headerIndexes['Отзывы']
     });
 
     var lastRow = sheet.getLastRow();
@@ -32,32 +36,42 @@ function parseRatingsFromLinks() {
     }
 
     var rowsCount = lastRow - 1;
-    var links = sheet
-      .getRange(2, headerIndexes['Ссылка'], rowsCount, 1)
-      .getValues();
+    var links = sheet.getRange(2, headerIndexes['Ссылка'], rowsCount, 1).getValues();
 
     var decimalSeparator = getDecimalSeparator_();
     addLog_(logs, 'INFO', 'Определен десятичный разделитель', {
       decimalSeparator: decimalSeparator
     });
-    var output = [];
+
+    var ratingOutput = [];
+    var reviewsOutput = [];
 
     for (var i = 0; i < links.length; i++) {
       var rowNumber = i + 2;
       var rawUrl = links[i][0];
-      var url = rawUrl ? String(rawUrl).trim() : '';
+      var url = normalizeUrl_(rawUrl);
 
       if (!url) {
-        output.push(['']);
+        ratingOutput.push(['']);
+        reviewsOutput.push(['']);
         addLog_(logs, 'INFO', 'Пустая ссылка, строка пропущена', {
-          row: rowNumber
+          row: rowNumber,
+          rawUrl: rawUrl
         });
         continue;
       }
 
+      addLog_(logs, 'INFO', 'Проверка ссылки', {
+        row: rowNumber,
+        rawUrl: rawUrl,
+        rawType: typeof rawUrl,
+        normalizedUrl: url
+      });
+
       try {
         if (!isValidHttpUrl_(url)) {
-          output.push(['']);
+          ratingOutput.push(['']);
+          reviewsOutput.push(['']);
           addLog_(logs, 'WARN', 'Невалидный URL', {
             row: rowNumber,
             url: url
@@ -67,25 +81,30 @@ function parseRatingsFromLinks() {
 
         var html = fetchHtml_(url);
         var rating = extractSecondRating_(html);
+        var reviewsCount = extractReviewsCount_(html);
 
-        if (!rating) {
-          output.push(['']);
-          addLog_(logs, 'WARN', 'Рейтинг не найден во втором блоке', {
-            row: rowNumber,
-            url: url
-          });
-          continue;
+        if (rating) {
+          var formattedRating = formatRatingForLocale_(rating, decimalSeparator);
+          ratingOutput.push([formattedRating]);
+        } else {
+          ratingOutput.push(['']);
         }
 
-        var formattedRating = formatRatingForLocale_(rating, decimalSeparator);
-        output.push([formattedRating]);
-        addLog_(logs, 'INFO', 'Рейтинг успешно извлечен', {
+        if (reviewsCount) {
+          reviewsOutput.push([reviewsCount]);
+        } else {
+          reviewsOutput.push(['']);
+        }
+
+        addLog_(logs, 'INFO', 'Данные успешно извлечены', {
           row: rowNumber,
           url: url,
-          rating: formattedRating
+          rating: rating || '',
+          reviews: reviewsCount || ''
         });
       } catch (error) {
-        output.push(['']);
+        ratingOutput.push(['']);
+        reviewsOutput.push(['']);
         addLog_(logs, 'ERROR', 'Ошибка обработки строки', {
           row: rowNumber,
           url: url,
@@ -94,9 +113,8 @@ function parseRatingsFromLinks() {
       }
     }
 
-    sheet
-      .getRange(2, headerIndexes['Рейтинг'], rowsCount, 1)
-      .setValues(output);
+    sheet.getRange(2, headerIndexes['Рейтинг'], rowsCount, 1).setValues(ratingOutput);
+    sheet.getRange(2, headerIndexes['Отзывы'], rowsCount, 1).setValues(reviewsOutput);
 
     addLog_(logs, 'INFO', 'Обновление завершено', {
       processedRows: rowsCount
@@ -131,12 +149,23 @@ function getHeaderIndexes_(sheet, requiredHeaders) {
   });
 
   if (missing.length > 0) {
-    throw new Error(
-      'Не найдены обязательные колонки: ' + missing.join(', ')
-    );
+    throw new Error('Не найдены обязательные колонки: ' + missing.join(', '));
   }
 
   return indexes;
+}
+
+/**
+ * Нормализует URL из ячейки.
+ */
+function normalizeUrl_(value) {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  return String(value)
+    .replace(/\u00A0/g, ' ')
+    .trim();
 }
 
 /**
@@ -145,6 +174,7 @@ function getHeaderIndexes_(sheet, requiredHeaders) {
 function fetchHtml_(url) {
   var response = UrlFetchApp.fetch(url, {
     muteHttpExceptions: true,
+    followRedirects: true,
     headers: {
       'User-Agent': 'Mozilla/5.0 (compatible; GoogleAppsScript/1.0)'
     }
@@ -187,6 +217,24 @@ function extractSecondRating_(html) {
 }
 
 /**
+ * Извлекает количество отзывов из блока:
+ * Отзывы ... b-doctor-details__toc-num">7
+ */
+function extractReviewsCount_(html) {
+  if (!html) {
+    return '';
+  }
+
+  var match = html.match(/Отзывы\s*<\/div>\s*<div[^>]*class="[^"]*b-doctor-details__toc-num[^"]*"[^>]*>\s*([0-9]+)/i);
+
+  if (!match || !match[1]) {
+    return '';
+  }
+
+  return match[1];
+}
+
+/**
  * Приводит рейтинг к разделителю, принятому в таблице.
  */
 function formatRatingForLocale_(rating, decimalSeparator) {
@@ -217,12 +265,21 @@ function getDecimalSeparator_() {
  * Проверяет, что строка является валидным HTTP(S) URL.
  */
 function isValidHttpUrl_(value) {
-  try {
-    var url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch (error) {
+  if (!value) {
     return false;
   }
+
+  var str = String(value).trim();
+
+  if (!/^https?:\/\//i.test(str)) {
+    return false;
+  }
+
+  if (/\s/.test(str)) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
