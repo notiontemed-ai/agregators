@@ -116,8 +116,9 @@ function updateRatings_(aggregatorKeys) {
       );
     }
 
-    var existingTargetByDoctor = getExistingTargetRowsByDoctor_(targetSheet);
-    var outputRows = [];
+    var existingTargetData = getExistingTargetData_(targetSheet);
+    var outputRows = existingTargetData.rows;
+    var todayKey = toDateKey_(now);
 
     for (var i = 0; i < sourceObjects.length; i++) {
       var rowNumber = i + 2;
@@ -133,8 +134,14 @@ function updateRatings_(aggregatorKeys) {
 
       var targetRow = createEmptyTargetRowObject_();
 
-      if (existingTargetByDoctor[doctorName]) {
-        copyTargetRow_(existingTargetByDoctor[doctorName], targetRow);
+      var doctorDateKey = doctorName + '||' + todayKey;
+      var existingTodayRow = existingTargetData.byDoctorDate[doctorDateKey];
+      var existingLatestRow = existingTargetData.latestByDoctor[doctorName];
+
+      if (existingTodayRow) {
+        copyTargetRow_(existingTodayRow.rowObj, targetRow);
+      } else if (existingLatestRow) {
+        copyTargetRow_(existingLatestRow.rowObj, targetRow);
       }
 
       targetRow['Дата'] = now;
@@ -207,11 +214,15 @@ function updateRatings_(aggregatorKeys) {
         }
       }
 
-      outputRows.push(
-        CONFIG.targetHeaders.map(function(header) {
-          return targetRow[header];
-        })
-      );
+      var outputRow = CONFIG.targetHeaders.map(function(header) {
+        return targetRow[header];
+      });
+
+      if (existingTodayRow) {
+        outputRows[existingTodayRow.arrayIndex] = outputRow;
+      } else {
+        outputRows.push(outputRow);
+      }
     }
 
     rewriteTargetSheet_(targetSheet, outputRows);
@@ -742,29 +753,70 @@ function findFirstHeader_(headerRow, candidates) {
   return '';
 }
 
-function getExistingTargetRowsByDoctor_(sheet) {
+function getExistingTargetData_(sheet) {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) {
-    return {};
+    return {
+      rows: [],
+      byDoctorDate: {},
+      latestByDoctor: {}
+    };
   }
 
-  var headerIndexes = getHeaderIndexes_(sheet, CONFIG.targetHeaders);
   var values = sheet.getRange(2, 1, lastRow - 1, CONFIG.targetHeaders.length).getValues();
-  var result = {};
+  var rows = [];
+  var byDoctorDate = {};
+  var latestByDoctor = {};
 
   for (var i = 0; i < values.length; i++) {
+    rows.push(values[i]);
+
     var rowObj = {};
     for (var j = 0; j < CONFIG.targetHeaders.length; j++) {
       rowObj[CONFIG.targetHeaders[j]] = values[i][j];
     }
 
     var doctor = normalizeText_(rowObj['Врач']);
-    if (doctor) {
-      result[doctor] = rowObj;
+    if (!doctor) {
+      continue;
+    }
+
+    var dateKey = toDateKey_(rowObj['Дата']);
+    if (dateKey) {
+      byDoctorDate[doctor + '||' + dateKey] = {
+        rowObj: rowObj,
+        arrayIndex: i
+      };
+    }
+
+    var rowTimestamp = getDateTimestamp_(rowObj['Дата']);
+    if (!latestByDoctor[doctor]) {
+      latestByDoctor[doctor] = {
+        rowObj: rowObj,
+        rowIndex: i,
+        timestamp: rowTimestamp
+      };
+      continue;
+    }
+
+    var currentLatest = latestByDoctor[doctor];
+    if (
+      rowTimestamp > currentLatest.timestamp ||
+      (rowTimestamp === currentLatest.timestamp && i > currentLatest.rowIndex)
+    ) {
+      latestByDoctor[doctor] = {
+        rowObj: rowObj,
+        rowIndex: i,
+        timestamp: rowTimestamp
+      };
     }
   }
 
-  return result;
+  return {
+    rows: rows,
+    byDoctorDate: byDoctorDate,
+    latestByDoctor: latestByDoctor
+  };
 }
 
 function createEmptyTargetRowObject_() {
@@ -780,6 +832,38 @@ function copyTargetRow_(fromObj, toObj) {
     var header = CONFIG.targetHeaders[i];
     toObj[header] = fromObj[header];
   }
+}
+
+function toDateKey_(value) {
+  var date = parseDateValue_(value);
+  if (!date) {
+    return '';
+  }
+
+  var timeZone = SpreadsheetApp.getActive().getSpreadsheetTimeZone() || Session.getScriptTimeZone();
+  return Utilities.formatDate(date, timeZone, 'yyyy-MM-dd');
+}
+
+function getDateTimestamp_(value) {
+  var date = parseDateValue_(value);
+  return date ? date.getTime() : 0;
+}
+
+function parseDateValue_(value) {
+  if (value instanceof Date) {
+    return new Date(value.getTime());
+  }
+
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  var parsed = new Date(value);
+  if (isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed;
 }
 
 function getHeaderIndexes_(sheet, requiredHeaders) {
