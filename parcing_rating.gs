@@ -417,45 +417,100 @@ function extractSzReviews_(html) {
 }
 
 /**
- * Клиники СЗ: ищем после блока "Выбор клиники" только названия клиник внутри label.
+ * Клиники СЗ:
+ * 1) если есть блок "Выбор клиники" — берем все клиники из него;
+ * 2) если блока нет — берем текущую клинику со страницы;
+ * 3) fallback — practicesAt;
+ * 4) fallback — servicesClinics, но только верхний объект клиники.
  */
 function extractSzClinics_(html) {
   if (!html) {
     return '';
   }
 
-  var startIdx = html.indexOf('aria-label="Выбор клиники"');
-  if (startIdx === -1) {
-    return '';
-  }
-
-  var tail = html.slice(startIdx);
   var clinics = [];
-  var labelRegex = /<label\b[\s\S]*?<\/label>/gi;
-  var labelMatch;
-  var scanned = 0;
-  var maxLabelsToScan = 30;
 
-  while ((labelMatch = labelRegex.exec(tail)) !== null && scanned < maxLabelsToScan) {
-    scanned++;
-    var labelHtml = labelMatch[0];
+  // 1. Если есть блок выбора клиники — берем названия из него
+  var clinicSelectorStart = html.indexOf('aria-label="Выбор клиники"');
+  if (clinicSelectorStart !== -1) {
+    var clinicTail = html.slice(clinicSelectorStart, clinicSelectorStart + 40000);
+    var labelRegex = /<label\b[\s\S]*?<\/label>/gi;
+    var labelMatch;
 
-    var clinicMatch = labelHtml.match(
-      /<span[^>]*class="[^"]*sdsClinicChip__t138vcdl[^"]*"[^>]*>\s*([\s\S]*?)\s*<\/span>/i
-    );
+    while ((labelMatch = labelRegex.exec(clinicTail)) !== null) {
+      var clinicMatch = labelMatch[0].match(
+        /<span[^>]*class="[^"]*sdsClinicChip__t138vcdl[^"]*"[^>]*>\s*([\s\S]*?)\s*<\/span>/i
+      );
 
-    if (clinicMatch && clinicMatch[1]) {
-      clinics.push(cleanExtractedText_(clinicMatch[1]));
+      if (clinicMatch && clinicMatch[1]) {
+        clinics.push(cleanExtractedText_(clinicMatch[1]));
+      }
     }
 
-    if (clinics.length > 0 && /<\/div>/.test(labelHtml)) {
-      // просто продолжаем, ограничение maxLabelsToScan защищает от ухода слишком далеко
+    var selectorResult = uniqueJoin_(clinics);
+    if (selectorResult) {
+      return selectorResult;
     }
   }
 
-  return uniqueJoin_(clinics);
+  // 2. Если клиника одна — берем только текущее название клиники со страницы
+  var currentClinicMatch = html.match(
+    /<(?:a|p)[^>]*data-testid="doctor-page__clinic-name"[^>]*>\s*([\s\S]*?)\s*<\/(?:a|p)>/i
+  );
+
+  if (currentClinicMatch && currentClinicMatch[1]) {
+    return cleanExtractedText_(currentClinicMatch[1]);
+  }
+
+  // 3. Fallback: practicesAt из JSON-LD
+  var practicesAtMatch = html.match(/"practicesAt":\[(.*?)\],"alumniOf"/);
+  if (practicesAtMatch && practicesAtMatch[1]) {
+    var practiceNameMatch = practicesAtMatch[1].match(/"name":"([^"]+)"/);
+    if (practiceNameMatch && practiceNameMatch[1]) {
+      return cleanJsonText_(practiceNameMatch[1]);
+    }
+  }
+
+  // 4. Fallback: servicesClinics, но берем только name верхнего объекта клиники
+  var servicesClinicMatch = html.match(/"servicesClinics":\[\{"id":[^{}]*?"name":"([^"]+)"/);
+  if (servicesClinicMatch && servicesClinicMatch[1]) {
+    return cleanJsonText_(servicesClinicMatch[1]);
+  }
+
+  return '';
 }
 
+/**
+ * Очистка текста, извлеченного из JSON.
+ */
+function cleanJsonText_(value) {
+  return normalizeText_(
+    String(value || '')
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\')
+      .replace(/\\u003c/gi, '<')
+      .replace(/\\u003e/gi, '>')
+      .replace(/\\u0026quot;/gi, '"')
+      .replace(/\\u0026amp;/gi, '&')
+      .replace(/\\u002F/gi, '/')
+  );
+}
+
+/**
+ * Очистка текста, извлеченного из JSON.
+ */
+function cleanJsonText_(value) {
+  return normalizeText_(
+    String(value || '')
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\')
+      .replace(/\\u003c/gi, '<')
+      .replace(/\\u003e/gi, '>')
+      .replace(/\\u0026quot;/gi, '"')
+      .replace(/\\u0026amp;/gi, '&')
+      .replace(/\\u002F/gi, '/')
+  );
+}
 /* =========================
    Общие утилиты
    ========================= */
