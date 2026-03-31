@@ -314,9 +314,7 @@ function extractPdReviews_(html) {
 
 /**
  * Клиники ПД:
- * 1) SSR-атрибут :lpu-address-list;
- * 2) fallback: data-review-power-info-open;
- * 3) fallback: адреса в отзывах.
+
  */
 function extractPdClinics_(html) {
   if (!html) {
@@ -326,14 +324,48 @@ function extractPdClinics_(html) {
   var matches = [];
   var match;
 
-  // 1) Основной источник: SSR-атрибут :lpu-address-list="..."
-  var lpuAttrMatch = html.match(/:lpu-address-list\s*=\s*"([^"]*)"/i);
+  function decodeHtmlAttrRaw_(text) {
+    return String(text || '')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#34;/gi, '"')
+      .replace(/&#x22;/gi, '"')
+      .replace(/&amp;/gi, '&')
+      .replace(/&#38;/gi, '&')
+      .replace(/&#x26;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&#60;/gi, '<')
+      .replace(/&#x3c;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&#62;/gi, '>')
+      .replace(/&#x3e;/gi, '>')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&#160;/gi, ' ')
+      .replace(/&#xA0;/gi, ' ')
+      .replace(/&#39;/gi, "'")
+      .replace(/&#x27;/gi, "'")
+      .replace(/&#92;/gi, '\\')
+      .replace(/&#x5c;/gi, '\\')
+      .replace(/&#(\d+);/g, function(_, code) {
+        return String.fromCharCode(Number(code));
+      })
+      .replace(/&#x([0-9a-f]+);/gi, function(_, code) {
+        return String.fromCharCode(parseInt(code, 16));
+      });
+  }
+
+  // 1) Основной источник: :lpu-address-list
+  var lpuAttrMatch =
+    html.match(/:lpu-address-list\s*=\s*"([\s\S]*?)"\s*:synonym-price-list=/i) ||
+    html.match(/:lpu-address-list\s*=\s*"([\s\S]*?)"\s*:is-appointment-on=/i) ||
+    html.match(/:lpu-address-list\s*=\s*"([\s\S]*?)"/i);
+
   if (lpuAttrMatch && lpuAttrMatch[1]) {
-    var decodedAttr = decodeHtmlEntities_(lpuAttrMatch[1]);
+    var rawAttr = lpuAttrMatch[1];
+    var decodedAttr = decodeHtmlAttrRaw_(rawAttr);
     var parsed = null;
 
     try {
-      parsed = JSON.parse(cleanJsonText_(decodedAttr));
+      parsed = JSON.parse(decodedAttr);
     } catch (error) {
       parsed = null;
     }
@@ -346,9 +378,12 @@ function extractPdClinics_(html) {
         }
       }
     } else {
-      // fallback-парсинг по lpu -> name, если JSON.parse не сработал
-      var lpuNameRegex = /"lpu"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([^"]+)"/gi;
-      while ((match = lpuNameRegex.exec(decodedAttr)) !== null) {
+      // Безопасный fallback: ищем именно lpu.name после блока town,
+      // чтобы не схватить town.name = "Санкт-Петербург"
+      var safeLpuNameRegex =
+        /"lpu"\s*:\s*\{[\s\S]*?"town"\s*:\s*\{[\s\S]*?"translations"\s*:\s*\{\}\s*\}\s*,\s*"name"\s*:\s*"((?:\\.|[^"\\])*)"/gi;
+
+      while ((match = safeLpuNameRegex.exec(decodedAttr)) !== null) {
         if (match[1]) {
           matches.push(cleanJsonText_(match[1]));
         }
@@ -361,11 +396,11 @@ function extractPdClinics_(html) {
     }
   }
 
-  // 2) Fallback: data-review-power-info-open="..."
+  // 2) Fallback: data-review-power-info-open
   matches = [];
-  var reviewInfoRegex = /data-review-power-info-open\s*=\s*"([^"]*)"/gi;
+  var reviewInfoRegex = /data-review-power-info-open\s*=\s*"([\s\S]*?)"/gi;
   while ((match = reviewInfoRegex.exec(html)) !== null) {
-    var decodedReviewInfo = decodeHtmlEntities_(match[1]);
+    var decodedReviewInfo = decodeHtmlAttrRaw_(match[1]);
     var reviewNameRegex = /name\s*:\s*'([^']+)'/gi;
     var nameMatch;
 
@@ -381,7 +416,7 @@ function extractPdClinics_(html) {
     return reviewInfoResult;
   }
 
-  // 3) Fallback: блоки адресов отзывов class="b-review-card__address"
+  // 3) Fallback: адреса в отзывах
   matches = [];
   var addressRegex = /<[^>]*class="[^"]*b-review-card__address[^"]*"[^>]*>([\s\S]*?)<\/[^>]+>/gi;
   while ((match = addressRegex.exec(html)) !== null) {
@@ -495,10 +530,6 @@ function extractSzReviews_(html) {
 
 /**
  * Клиники СЗ:
- * 1) если есть блок "Выбор клиники" — берем все клиники из него;
- * 2) если блока нет — берем текущую клинику со страницы;
- * 3) fallback — practicesAt;
- * 4) fallback — servicesClinics, но только верхний объект клиники.
  */
 function extractSzClinics_(html) {
   if (!html) {
@@ -506,31 +537,24 @@ function extractSzClinics_(html) {
   }
 
   var clinics = [];
+  var match;
 
-  // 1. Если есть блок выбора клиники — берем названия из него
-  var clinicSelectorStart = html.indexOf('aria-label="Выбор клиники"');
-  if (clinicSelectorStart !== -1) {
-    var clinicTail = html.slice(clinicSelectorStart, clinicSelectorStart + 40000);
-    var labelRegex = /<label\b[\s\S]*?<\/label>/gi;
-    var labelMatch;
+  // 1. Основной источник: только clinic chips.
+  // Якоримся не на <label>, а на input с data-testid клиники.
+  var clinicChipRegex = /<input[^>]*data-testid="doctor-page_filters-clinic-chip-\d+"[^>]*>[\s\S]{0,2000}?<span[^>]*class="[^"]*sdsClinicChip__t138vcdl[^"]*"[^>]*>\s*([\s\S]*?)\s*<\/span>/gi;
 
-    while ((labelMatch = labelRegex.exec(clinicTail)) !== null) {
-      var clinicMatch = labelMatch[0].match(
-        /<span[^>]*class="[^"]*sdsClinicChip__t138vcdl[^"]*"[^>]*>\s*([\s\S]*?)\s*<\/span>/i
-      );
-
-      if (clinicMatch && clinicMatch[1]) {
-        clinics.push(cleanExtractedText_(clinicMatch[1]));
-      }
-    }
-
-    var selectorResult = uniqueJoin_(clinics);
-    if (selectorResult) {
-      return selectorResult;
+  while ((match = clinicChipRegex.exec(html)) !== null) {
+    if (match[1]) {
+      clinics.push(cleanExtractedText_(match[1]));
     }
   }
 
-  // 2. Если клиника одна — берем только текущее название клиники со страницы
+  var clinicResult = uniqueJoin_(clinics);
+  if (clinicResult) {
+    return clinicResult;
+  }
+
+  // 2. Если клиника одна и chips не нашли — берем текущее название клиники со страницы
   var currentClinicMatch = html.match(
     /<(?:a|p)[^>]*data-testid="doctor-page__clinic-name"[^>]*>\s*([\s\S]*?)\s*<\/(?:a|p)>/i
   );
@@ -539,7 +563,7 @@ function extractSzClinics_(html) {
     return cleanExtractedText_(currentClinicMatch[1]);
   }
 
-  // 3. Fallback: practicesAt из JSON-LD
+  // 3. Fallback: practicesAt
   var practicesAtMatch = html.match(/"practicesAt":\[(.*?)\],"alumniOf"/);
   if (practicesAtMatch && practicesAtMatch[1]) {
     var practiceNameMatch = practicesAtMatch[1].match(/"name":"([^"]+)"/);
@@ -548,7 +572,7 @@ function extractSzClinics_(html) {
     }
   }
 
-  // 4. Fallback: servicesClinics, но берем только name верхнего объекта клиники
+  // 4. Fallback: servicesClinics
   var servicesClinicMatch = html.match(/"servicesClinics":\[\{"id":[^{}]*?"name":"([^"]+)"/);
   if (servicesClinicMatch && servicesClinicMatch[1]) {
     return cleanJsonText_(servicesClinicMatch[1]);
