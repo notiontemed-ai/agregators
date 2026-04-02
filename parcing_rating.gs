@@ -49,6 +49,14 @@ const CONFIG = {
       reviewsHeader: 'Отзывы СЗ',
       clinicsHeader: 'Клиники СЗ'
     }
+  },
+
+  fetchOptions: {
+    maxAttempts: 4,
+    baseDelayMs: 1200,
+    maxDelayMs: 10000,
+    jitterMs: 700,
+    requestDelayMs: 350
   }
 };
 
@@ -778,20 +786,81 @@ function cleanJsonText_(value) {
    ========================= */
 
 function fetchHtml_(url) {
-  var response = UrlFetchApp.fetch(url, {
-    muteHttpExceptions: true,
-    followRedirects: true,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; GoogleAppsScript/1.0)'
-    }
-  });
+  var options = CONFIG.fetchOptions || {};
+  var maxAttempts = Math.max(1, Number(options.maxAttempts) || 1);
+  var baseDelayMs = Math.max(0, Number(options.baseDelayMs) || 1000);
+  var maxDelayMs = Math.max(baseDelayMs, Number(options.maxDelayMs) || 8000);
+  var jitterMs = Math.max(0, Number(options.jitterMs) || 500);
+  var requestDelayMs = Math.max(0, Number(options.requestDelayMs) || 0);
 
-  var statusCode = response.getResponseCode();
-  if (statusCode < 200 || statusCode >= 400) {
-    throw new Error('HTTP status: ' + statusCode);
+  if (requestDelayMs > 0 || jitterMs > 0) {
+    sleepMs_(requestDelayMs + randomInt_(0, jitterMs));
   }
 
-  return response.getContentText();
+  var lastErrorMessage = '';
+
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    var response = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      followRedirects: true,
+      headers: buildFetchHeaders_()
+    });
+
+    var statusCode = response.getResponseCode();
+    if (statusCode >= 200 && statusCode < 400) {
+      return response.getContentText();
+    }
+
+    lastErrorMessage = 'HTTP status: ' + statusCode;
+    var canRetry = isRetriableHttpStatus_(statusCode);
+    if (!canRetry || attempt >= maxAttempts) {
+      throw new Error(lastErrorMessage);
+    }
+
+    var backoffMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
+    sleepMs_(backoffMs + randomInt_(0, jitterMs));
+  }
+
+  throw new Error(lastErrorMessage || 'HTTP status: unknown');
+}
+
+function buildFetchHeaders_() {
+  var userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+  ];
+
+  return {
+    'User-Agent': userAgents[randomInt_(0, userAgents.length - 1)],
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
+  };
+}
+
+function isRetriableHttpStatus_(statusCode) {
+  return statusCode === 403 || statusCode === 429 || statusCode >= 500;
+}
+
+function sleepMs_(ms) {
+  var safeMs = Math.max(0, Math.min(300000, Math.floor(Number(ms) || 0)));
+  if (safeMs > 0) {
+    Utilities.sleep(safeMs);
+  }
+}
+
+function randomInt_(min, max) {
+  var from = Math.floor(Number(min) || 0);
+  var to = Math.floor(Number(max) || 0);
+  if (to < from) {
+    var temp = from;
+    from = to;
+    to = temp;
+  }
+
+  return Math.floor(Math.random() * (to - from + 1)) + from;
 }
 
 function formatRatingForLocale_(rating, decimalSeparator) {
