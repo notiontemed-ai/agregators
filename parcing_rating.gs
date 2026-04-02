@@ -3,6 +3,7 @@ const CONFIG = {
   sourceSheetName: 'Врачи',
   targetSheetName: 'Рейтинг',
   logSheetName: 'Log',
+  announcementWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook-test/57353eb1-2f1c-4f4c-ab0a-995c84a617cf',
 
   sourceDoctorHeaders: ['Врач', 'ФИО', 'Доктор'],
 
@@ -62,6 +63,7 @@ function onOpen() {
     .addItem('Обновить СЗ', 'updateSzRatings')
     .addSeparator()
     .addItem('Обновить все рейтинги', 'updateAllRatings')
+    .addItem('Отправить анонс', 'sendRatingAnnouncement')
     .addToUi();
 }
 
@@ -79,6 +81,116 @@ function updateSzRatings() {
 
 function updateAllRatings() {
   updateRatings_(['pd', 'np', 'sz']);
+}
+
+function sendRatingAnnouncement() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.targetSheetName);
+
+  if (!sheet) {
+    ui.alert('Лист "' + CONFIG.targetSheetName + '" не найден.');
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var lastColumn = sheet.getLastColumn();
+  if (lastRow < 2 || lastColumn < 1) {
+    ui.alert('На листе "' + CONFIG.targetSheetName + '" нет данных для отправки.');
+    return;
+  }
+
+  var headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(function(value) {
+    return normalizeText_(value);
+  });
+  var dateColumnIndex = headers.indexOf('Дата');
+  if (dateColumnIndex === -1) {
+    ui.alert('На листе "' + CONFIG.targetSheetName + '" не найден столбец "Дата".');
+    return;
+  }
+
+  var values = sheet.getRange(2, 1, lastRow - 1, lastColumn).getValues();
+  var today = new Date();
+  var todayKey = toDateKey_(today);
+
+  var latestDate = null;
+  for (var i = 0; i < values.length; i++) {
+    var rowDate = parseDateValue_(values[i][dateColumnIndex]);
+    if (!rowDate) {
+      continue;
+    }
+
+    if (!latestDate || rowDate.getTime() > latestDate.getTime()) {
+      latestDate = rowDate;
+    }
+  }
+
+  if (!latestDate) {
+    ui.alert('На листе "' + CONFIG.targetSheetName + '" нет валидных дат в столбце "Дата".');
+    return;
+  }
+
+  var latestDateKey = toDateKey_(latestDate);
+  if (latestDateKey !== todayKey) {
+    var button = ui.alert(
+      'Внимание: дата не совпадает',
+      'Дата запуска: ' + todayKey + '. Последняя дата на листе "' + CONFIG.targetSheetName + '": ' + latestDateKey + '. Продолжить отправку?',
+      ui.ButtonSet.YES_NO
+    );
+
+    if (button !== ui.Button.YES) {
+      ui.alert('Отправка отменена пользователем.');
+      return;
+    }
+  }
+
+  var weekStart = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 6);
+  var weekEnd = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
+  var rowsForWebhook = [];
+
+  for (var j = 0; j < values.length; j++) {
+    var itemDate = parseDateValue_(values[j][dateColumnIndex]);
+    if (!itemDate) {
+      continue;
+    }
+
+    if (itemDate.getTime() < weekStart.getTime() || itemDate.getTime() > weekEnd.getTime()) {
+      continue;
+    }
+
+    rowsForWebhook.push(mapRowToWebhookObject_(headers, values[j]));
+  }
+
+  if (rowsForWebhook.length === 0) {
+    ui.alert('За последнюю неделю нет данных для отправки.');
+    return;
+  }
+
+  var payload = {
+    sheetName: CONFIG.targetSheetName,
+    generatedAt: new Date().toISOString(),
+    period: {
+      from: toDateKey_(weekStart),
+      to: toDateKey_(today)
+    },
+    latestSheetDate: latestDateKey,
+    rows: rowsForWebhook
+  };
+
+  var response = UrlFetchApp.fetch(CONFIG.announcementWebhookUrl, {
+    method: 'post',
+    contentType: 'application/json; charset=utf-8',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  var statusCode = response.getResponseCode();
+  if (statusCode < 200 || statusCode >= 300) {
+    ui.alert('Ошибка отправки: HTTP ' + statusCode + '. Ответ: ' + response.getContentText());
+    return;
+  }
+
+  ui.alert('Анонс успешно отправлен. Передано строк: ' + rowsForWebhook.length + '.');
 }
 
 /**
@@ -764,6 +876,23 @@ function decodeHtmlEntities_(text) {
     .replace(/&gt;/gi, '>');
 
   return normalizeText_(result);
+}
+
+function mapRowToWebhookObject_(headers, row) {
+  var result = {};
+
+  for (var i = 0; i < headers.length; i++) {
+    var header = headers[i] || ('column_' + (i + 1));
+    var value = row[i];
+
+    if (value instanceof Date) {
+      result[header] = value.toISOString();
+    } else {
+      result[header] = value;
+    }
+  }
+
+  return result;
 }
 
 function uniqueJoin_(items) {
