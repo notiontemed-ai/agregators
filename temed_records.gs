@@ -8,12 +8,16 @@ const ERROR_SHEET_NAME = 'Ошибки купонов';
 const MENU_NAME = 'TEMED';
 const MENU_ITEM_NAME = 'Обработать записи';
 const MENU_COUPON_ITEM_NAME = 'Обработать купоны';
+const MENU_ANNOUNCEMENT_ITEM_NAME = 'Отправить анонс';
+const ANNOUNCEMENT_WEBHOOK_URL =
+  'https://n8n-x3.tech.temed.ru/webhook-test/57353eb1-2f1c-4f4c-ab0a-995c84a617cf';
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu(MENU_NAME)
     .addItem(MENU_ITEM_NAME, 'processTemedRecords')
     .addItem(MENU_COUPON_ITEM_NAME, 'processTemedCoupons')
+    .addItem(MENU_ANNOUNCEMENT_ITEM_NAME, 'sendTemedAnnouncement')
     .addToUi();
 }
 
@@ -116,6 +120,124 @@ function processTemedCoupons() {
   sourceSpreadsheet.deleteSheet(sourceSheet);
 
   ui.alert(`Обработка купонов завершена. Перенесено строк: ${parseResult.rows.length}.`);
+}
+
+function sendTemedAnnouncement() {
+  const ui = SpreadsheetApp.getUi();
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const ratingSheet = spreadsheet.getSheetByName('Рейтинг');
+
+  if (!ratingSheet) {
+    ui.alert('Лист "Рейтинг" не найден.');
+    return;
+  }
+
+  const values = ratingSheet.getDataRange().getValues();
+  if (values.length < 2) {
+    ui.alert('На листе "Рейтинг" нет данных для отправки.');
+    return;
+  }
+
+  const headers = values[0].map((value) => String(value || '').trim());
+  const dateColumnIndex = headers.indexOf('Дата');
+  if (dateColumnIndex === -1) {
+    ui.alert('На листе "Рейтинг" не найден столбец "Дата".');
+    return;
+  }
+
+  const today = new Date();
+  const todayKey = toDateKeyLocal_(today);
+
+  const rows = values.slice(1);
+  let latestDate = null;
+
+  rows.forEach((row) => {
+    const rowDate = toDate_(row[dateColumnIndex]);
+    if (!rowDate) {
+      return;
+    }
+
+    if (!latestDate || rowDate.getTime() > latestDate.getTime()) {
+      latestDate = rowDate;
+    }
+  });
+
+  if (!latestDate) {
+    ui.alert('На листе "Рейтинг" нет валидных дат в столбце "Дата".');
+    return;
+  }
+
+  const latestDateKey = toDateKeyLocal_(latestDate);
+  if (latestDateKey !== todayKey) {
+    const userChoice = ui.alert(
+      'Внимание: дата не совпадает',
+      `Дата запуска: ${todayKey}. Последняя дата на листе "Рейтинг": ${latestDateKey}. Продолжить отправку?`,
+      ui.ButtonSet.YES_NO
+    );
+
+    if (userChoice !== ui.Button.YES) {
+      ui.alert('Отправка отменена пользователем.');
+      return;
+    }
+  }
+
+  const weekStart = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 6);
+  const weekRows = rows
+    .map((row) => {
+      const rowDate = toDate_(row[dateColumnIndex]);
+      return { row, rowDate };
+    })
+    .filter((item) => item.rowDate && item.rowDate.getTime() >= weekStart.getTime() && item.rowDate.getTime() <= today.getTime())
+    .map((item) => mapRowToObject_(headers, item.row));
+
+  if (weekRows.length === 0) {
+    ui.alert('За последнюю неделю нет данных для отправки.');
+    return;
+  }
+
+  const payload = {
+    reportName: 'Рейтинг',
+    generatedAt: new Date().toISOString(),
+    period: {
+      from: toDateKeyLocal_(weekStart),
+      to: todayKey
+    },
+    latestSheetDate: latestDateKey,
+    rows: weekRows
+  };
+
+  const response = UrlFetchApp.fetch(ANNOUNCEMENT_WEBHOOK_URL, {
+    method: 'post',
+    contentType: 'application/json; charset=utf-8',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const status = response.getResponseCode();
+  if (status < 200 || status >= 300) {
+    ui.alert(`Ошибка отправки: HTTP ${status}. Ответ: ${response.getContentText()}`);
+    return;
+  }
+
+  ui.alert(`Анонс успешно отправлен. Передано строк: ${weekRows.length}.`);
+}
+
+function mapRowToObject_(headers, row) {
+  const obj = {};
+  for (let i = 0; i < headers.length; i += 1) {
+    const key = headers[i] || `column_${i + 1}`;
+    const value = row[i];
+    obj[key] = value instanceof Date ? value.toISOString() : value;
+  }
+  return obj;
+}
+
+function toDateKeyLocal_(value) {
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    return '';
+  }
+
+  return Utilities.formatDate(value, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 }
 
 function loadClinicMapping_(reportSpreadsheet, titleColumnName) {
