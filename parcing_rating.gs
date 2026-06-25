@@ -3,7 +3,7 @@ const CONFIG = {
   sourceSheetName: 'Врачи',
   targetSheetName: 'Рейтинг',
   logSheetName: 'Log',
-  announcementWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook-test/57353eb1-2f1c-4f4c-ab0a-995c84a617cf',
+  announcementWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook/57353eb1-2f1c-4f4c-ab0a-995c84a617cf',
 
   sourceDoctorHeaders: ['Врач', 'ФИО', 'Доктор'],
 
