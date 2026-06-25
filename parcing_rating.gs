@@ -786,6 +786,20 @@ function cleanJsonText_(value) {
    ========================= */
 
 function fetchHtml_(url) {
+  var result = fetchGenericHtml_(url, null);
+
+  if (result && result.ok === true) {
+    return result.html;
+  }
+
+  throw new Error(formatFetchErrorMessage_(result));
+}
+
+function fetchPdHtml_(url) {
+  return fetchGenericHtml_(url, 'pd');
+}
+
+function fetchGenericHtml_(url, aggregatorKey) {
   var options = CONFIG.fetchOptions || {};
   var maxAttempts = Math.max(1, Number(options.maxAttempts) || 1);
   var baseDelayMs = Math.max(0, Number(options.baseDelayMs) || 1000);
@@ -797,31 +811,93 @@ function fetchHtml_(url) {
     sleepMs_(requestDelayMs + randomInt_(0, jitterMs));
   }
 
-  var lastErrorMessage = '';
+  var lastResult = {
+    ok: false,
+    statusCode: null,
+    error: ''
+  };
 
   for (var attempt = 1; attempt <= maxAttempts; attempt++) {
-    var response = UrlFetchApp.fetch(url, {
-      muteHttpExceptions: true,
-      followRedirects: true,
-      headers: buildFetchHeaders_()
-    });
+    try {
+      var response = UrlFetchApp.fetch(url, {
+        muteHttpExceptions: true,
+        followRedirects: true,
+        headers: buildFetchHeaders_(aggregatorKey)
+      });
 
-    var statusCode = response.getResponseCode();
-    if (statusCode >= 200 && statusCode < 400) {
-      return response.getContentText();
-    }
+      var statusCode = response.getResponseCode();
+      if (statusCode >= 200 && statusCode < 400) {
+        return {
+          ok: true,
+          html: response.getContentText(),
+          statusCode: statusCode,
+          error: ''
+        };
+      }
 
-    lastErrorMessage = 'HTTP status: ' + statusCode;
-    var canRetry = isRetriableHttpStatus_(statusCode);
-    if (!canRetry || attempt >= maxAttempts) {
-      throw new Error(lastErrorMessage);
+      lastResult = {
+        ok: false,
+        statusCode: statusCode,
+        error: ''
+      };
+
+      var canRetry = isRetriableHttpStatus_(statusCode);
+      if (!canRetry || attempt >= maxAttempts) {
+        return lastResult;
+      }
+    } catch (error) {
+      lastResult = {
+        ok: false,
+        statusCode: null,
+        error: error && error.message ? error.message : String(error)
+      };
+
+      if (attempt >= maxAttempts) {
+        return lastResult;
+      }
     }
 
     var backoffMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
     sleepMs_(backoffMs + randomInt_(0, jitterMs));
   }
 
-  throw new Error(lastErrorMessage || 'HTTP status: unknown');
+  return lastResult;
+}
+
+function formatFetchErrorMessage_(result) {
+  if (result && result.statusCode) {
+    return 'HTTP status: ' + result.statusCode;
+  }
+
+  if (result && result.error) {
+    return String(result.error);
+  }
+
+  return 'Не удалось загрузить HTML';
+}
+
+function testRatingUrlFetch() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Проверка загрузки ПД', 'Введите URL страницы ПД:', ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() !== ui.Button.OK) {
+    ui.alert('Проверка отменена.');
+    return;
+  }
+
+  var url = normalizeUrl_(response.getResponseText());
+  if (!isValidHttpUrl_(url)) {
+    ui.alert('Некорректный URL. Укажите ссылку, начинающуюся с http:// или https://.');
+    return;
+  }
+
+  var result = fetchPdHtml_(url);
+  if (result.ok === true) {
+    ui.alert('HTML успешно загружен. Длина ответа: ' + String(result.html || '').length + ' символов.');
+    return;
+  }
+
+  ui.alert('Ошибка загрузки HTML: ' + formatFetchErrorMessage_(result));
 }
 
 function buildFetchHeaders_() {
