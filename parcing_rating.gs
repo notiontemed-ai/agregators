@@ -434,6 +434,9 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
     if (!doctorName) {
       var missingNameTransition = buildRatingItemTransition_({ nextSourceIndex: p, retryQueuePosition: p }, sourceIndex, { status: 'empty' }, isRetryStage);
       applyRatingItemTransition_(job, runStats, missingNameTransition, isRetryStage, p);
+      if (aggregatorKey === 'pd') {
+        ctx.consecutiveFullFailures = updatePdConsecutiveFailureCount_(ctx.consecutiveFullFailures, 'empty');
+      }
       job.updatedAt = new Date().toISOString();
       saveRatingJob_(aggregatorKey, job);
       continue;
@@ -471,14 +474,13 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
 
     if (result.status === 'success') {
       writeAggregatorValues_(targetSheet, todayEntry.arrayIndex + 2, columns, result.values);
-      ctx.consecutiveFullFailures = 0;
     }
 
     var transition = buildRatingItemTransition_(job, sourceIndex, result, isRetryStage);
     applyRatingItemTransition_(job, runStats, transition, isRetryStage, p);
 
-    if (result.status === 'temporary' && aggregatorKey === 'pd') {
-      ctx.consecutiveFullFailures++;
+    if (aggregatorKey === 'pd') {
+      ctx.consecutiveFullFailures = updatePdConsecutiveFailureCount_(ctx.consecutiveFullFailures, result.status);
       if (ctx.consecutiveFullFailures >= CONFIG.ratingJobs.pd.consecutiveFullFailureLimit) {
         job.status = 'waiting_retry';
         job.retryAfter = new Date(Date.now() + CONFIG.ratingJobs.pd.retryCooldownMs).toISOString();
@@ -737,6 +739,16 @@ function buildRatingItemTransition_(currentState, sourceIndex, result, isRetrySt
     itemStats.preservedPrevious = 1;
   }
   return transition;
+}
+
+function updatePdConsecutiveFailureCount_(currentCount, resultStatus) {
+  if (resultStatus === 'temporary') {
+    return Number(currentCount || 0) + 1;
+  }
+  if (resultStatus === 'deferred') {
+    return Number(currentCount || 0);
+  }
+  return 0;
 }
 
 function applyRatingItemTransition_(job, runStats, transition, isRetryStage, position) {
