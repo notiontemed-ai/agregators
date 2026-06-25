@@ -67,28 +67,67 @@ assert.equal(ratingJobsKeys.length, 1, 'CONFIG contains exactly one ratingJobs k
 assert.doesNotMatch(configMatch[1], /\bstoragePrefix\s*:/, 'CONFIG.ratingJobs does not keep storagePrefix');
 assert.doesNotMatch(configMatch[1], /\bbatchMaxRuntimeMs\s*:/, 'CONFIG.ratingJobs does not keep batchMaxRuntimeMs');
 
+
+assert.match(parcing, /function assertRatingJobHelpers_\(\)/, 'production code defines helper availability assertion');
+assert.match(parcing, /assertRatingJobHelpers_\(\);/, 'production code checks retry_queue_state.js helper availability');
+assert.match(parcing, /writeAndSaveReserveMs:\s*10000/, 'write-and-save reserve is configured');
+assert.match(parcing, /stateSaveReserveMs:\s*3000/, 'state-save reserve is configured');
+
 assert.match(parcing, /announcementWebhookUrl:\s*'https:\/\/n8n-x3\.tech\.temed\.ru\/webhook\//, 'production webhook URL is used');
 assert.doesNotMatch(parcing, /announcementWebhookUrl:[^\n]*\/webhook-test\//, 'webhook-test URL is not used');
 
 assert.match(parcing, /function startRatingJob_\(aggregatorKey\) \{\s*createOrContinueRatingJob_\(aggregatorKey\);\s*resumePendingRatingJobs\(\);\s*\}/, 'single-aggregator starts resume the common queue');
 assert.match(parcing, /function resumePendingRatingJobs\(\) \{\s*var selected = selectPendingRatingJob_\(\);\s*if \(!selected\) \{\s*return;\s*\}/, 'empty queue returns without debug log');
 
-const pureHelpersSource = parcing.match(/function isDeferredFetchResult_[\s\S]*?\nfunction isParsedResultValid_/)[0].replace(/\nfunction isParsedResultValid_$/, '');
-const sandbox = {
-  mergeUniqueIndexes_: (a, b) => Array.from(new Set([...(a || []), ...(b || [])].map(Number)))
-};
+const helperStart = parcing.indexOf('function mergeUniqueIndexes_');
+const helperEnd = parcing.indexOf('function isParsedResultValid_', helperStart);
+const pureHelpersSource = parcing.slice(helperStart, helperEnd);
+const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(pureHelpersSource, sandbox);
 assert.equal(sandbox.isDeferredFetchResult_({ ok: false, deferred: true, error: 'SAFE_TIME_LIMIT_NEAR' }), true, 'SAFE_TIME_LIMIT_NEAR is deferred');
-const deferredDecision = sandbox.applyRatingJobDecision_({ nextSourceIndex: 3, retryQueuePosition: 1, failedIndexes: [], retryFailedIndexes: [], processedInRun: 0, temporaryErrors: 0, preservedPrevious: 0, status: 'running' }, 12, { status: 'deferred', reason: 'SAFE_TIME_LIMIT_NEAR' }, false);
-assert.equal(deferredDecision.status, 'pending', 'deferred doctor pauses job');
-assert.equal(deferredDecision.nextSourceIndex, 3, 'deferred doctor does not advance main position');
-assert.equal(deferredDecision.retryQueuePosition, 1, 'deferred doctor does not advance retry position');
-assert.deepEqual(deferredDecision.failedIndexes, [], 'deferred doctor is not added to failedIndexes');
-assert.deepEqual(deferredDecision.retryFailedIndexes, [], 'deferred doctor is not added to retryFailedIndexes');
-assert.equal(deferredDecision.processedInRun, 0, 'deferred doctor is not counted as processed');
-assert.equal(deferredDecision.temporaryErrors, 0, 'deferred doctor is not counted as temporary error');
-assert.equal(deferredDecision.preservedPrevious, 0, 'deferred doctor is not counted as preserved');
+
+assert.match(parcing, /buildRatingItemTransition_\(job, sourceIndex, result, isRetryStage\)/, 'production loop calls buildRatingItemTransition_ for doctor results');
+assert.doesNotMatch(parcing, /function\s+applyRatingJobDecision_\s*\(/, 'unused applyRatingJobDecision_ helper is removed');
+
+const runStats = sandbox.createRatingRunStats_();
+const jobStats = { permanentErrors: 10, temporaryErrors: 20, preservedPrevious: 30 };
+for (const result of [
+  { status: 'success' },
+  { status: 'temporary' },
+  { status: 'permanent' },
+  { status: 'empty' },
+  { status: 'success' }
+]) {
+  const transition = sandbox.buildRatingItemTransition_(jobStats, 1, result, false);
+  sandbox.applyRatingItemStats_(jobStats, runStats, transition.itemStats);
+}
+assert.deepEqual(JSON.parse(JSON.stringify(runStats)), { processed: 5, success: 2, preservedPrevious: 3, permanentErrors: 1, temporaryErrors: 1 }, 'run stats accumulate the whole batch');
+assert.equal(jobStats.temporaryErrors, 21, 'job temporary errors increase by batch delta');
+assert.equal(jobStats.permanentErrors, 11, 'job permanent errors increase by batch delta');
+assert.equal(jobStats.preservedPrevious, 33, 'job preserved values increase by batch delta');
+
+const deferredTransition = sandbox.buildRatingItemTransition_({ nextSourceIndex: 3, retryQueuePosition: 1 }, 12, { status: 'deferred', reason: 'SAFE_TIME_LIMIT_NEAR' }, false);
+assert.equal(deferredTransition.nextStatus, 'pending', 'deferred doctor pauses job');
+assert.equal(deferredTransition.shouldAdvance, false, 'deferred doctor does not advance position');
+assert.deepEqual(Array.from(deferredTransition.addToFailedIndexes), [], 'deferred doctor is not added to failedIndexes');
+assert.deepEqual(JSON.parse(JSON.stringify(deferredTransition.itemStats)), { processed: 0, success: 0, preservedPrevious: 0, permanentErrors: 0, temporaryErrors: 0 }, 'deferred doctor does not change stats');
+
+const tempTransition = sandbox.buildRatingItemTransition_({}, 12, { status: 'temporary' }, false);
+assert.equal(tempTransition.shouldAdvance, true, 'temporary result advances after HTTP result is received');
+assert.deepEqual(Array.from(tempTransition.addToFailedIndexes), [12], 'temporary result is added to retry queue');
+assert.deepEqual(JSON.parse(JSON.stringify(tempTransition.itemStats)), { processed: 1, success: 0, preservedPrevious: 1, permanentErrors: 0, temporaryErrors: 1 }, 'temporary result stats are captured');
+
+const retryTempTransition = sandbox.buildRatingItemTransition_({}, 12, { status: 'temporary' }, true);
+assert.deepEqual(Array.from(retryTempTransition.addToRetryFailedIndexes), [12], 'retry temporary result is added to retryFailedIndexes');
+
+const statusSource = parcing.match(/function buildRatingJobStatusStage_[\s\S]*?\nfunction assertRatingJobHelpers_/)[0].replace(/\nfunction assertRatingJobHelpers_$/, '');
+vm.runInContext(statusSource, sandbox);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sandbox.buildRatingJobStatusStage_({ retryQueueSnapshot: [5, 8, 12, 20], retryQueuePosition: 2, retryFailedIndexes: [5], retryRound: 1 }, 100))),
+  { stage: 'повтор ошибок', retryRound: 1, retryPosition: 2, retryTotal: 4, retryRemaining: 2, retryFailed: 1 },
+  'retry status displays retry queue progress'
+);
 
 const selectSource = parcing.match(/function isStaleJob_[\s\S]*?\nfunction ensureTodayRows_/)[0].replace(/\nfunction ensureTodayRows_$/, '');
 function selectWithJobs(jobs) {
