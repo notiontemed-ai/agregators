@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "test": "node tests/rating_jobs_retry.test.js"
+  }
+}
