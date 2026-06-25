@@ -88,6 +88,7 @@ vm.runInContext(pureHelpersSource, sandbox);
 assert.equal(sandbox.isDeferredFetchResult_({ ok: false, deferred: true, error: 'SAFE_TIME_LIMIT_NEAR' }), true, 'SAFE_TIME_LIMIT_NEAR is deferred');
 
 assert.match(parcing, /buildRatingItemTransition_\(job, sourceIndex, result, isRetryStage\)/, 'production loop calls buildRatingItemTransition_ for doctor results');
+assert.match(parcing, /updatePdConsecutiveFailureCount_\(/, 'production code uses PD consecutive failure helper');
 assert.doesNotMatch(parcing, /function\s+applyRatingJobDecision_\s*\(/, 'unused applyRatingJobDecision_ helper is removed');
 
 const runStats = sandbox.createRatingRunStats_();
@@ -120,6 +121,55 @@ assert.deepEqual(JSON.parse(JSON.stringify(tempTransition.itemStats)), { process
 
 const retryTempTransition = sandbox.buildRatingItemTransition_({}, 12, { status: 'temporary' }, true);
 assert.deepEqual(Array.from(retryTempTransition.addToRetryFailedIndexes), [12], 'retry temporary result is added to retryFailedIndexes');
+
+function pdFailureScenario(statuses, limit) {
+  let count = 0;
+  let waitingRetry = false;
+  for (const status of statuses) {
+    count = sandbox.updatePdConsecutiveFailureCount_(count, status);
+    if (count >= limit) {
+      waitingRetry = true;
+      break;
+    }
+  }
+  return { count, waitingRetry };
+}
+
+assert.deepEqual(
+  pdFailureScenario(['temporary', 'temporary', 'temporary'], 3),
+  { count: 3, waitingRetry: true },
+  'three consecutive temporary PD failures reach waiting_retry limit'
+);
+assert.deepEqual(
+  pdFailureScenario(['temporary', 'permanent', 'temporary', 'temporary'], 3),
+  { count: 2, waitingRetry: false },
+  'permanent PD error breaks consecutive temporary failure series'
+);
+assert.deepEqual(
+  pdFailureScenario(['temporary', 'empty', 'temporary'], 3),
+  { count: 1, waitingRetry: false },
+  'empty PD result breaks consecutive temporary failure series'
+);
+assert.deepEqual(
+  pdFailureScenario(['temporary', 'temporary', 'success'], 3),
+  { count: 0, waitingRetry: false },
+  'successful PD result resets consecutive temporary failure series'
+);
+assert.deepEqual(
+  pdFailureScenario(['temporary', 'deferred'], 3),
+  { count: 1, waitingRetry: false },
+  'deferred PD result keeps the current consecutive temporary failure count'
+);
+assert.deepEqual(
+  pdFailureScenario(['temporary', 'temporary', 'deferred', 'temporary'], 3),
+  { count: 3, waitingRetry: true },
+  'deferred PD result does not break an existing consecutive temporary failure series'
+);
+assert.deepEqual(
+  pdFailureScenario(['temporary', 'permanent', 'temporary', 'empty', 'temporary', 'success', 'temporary'], 3),
+  { count: 1, waitingRetry: false },
+  'multiple non-temporary PD results break consecutive temporary failure series'
+);
 
 const statusSource = parcing.match(/function buildRatingJobStatusStage_[\s\S]*?\nfunction assertRatingJobHelpers_/)[0].replace(/\nfunction assertRatingJobHelpers_$/, '');
 vm.runInContext(statusSource, sandbox);
