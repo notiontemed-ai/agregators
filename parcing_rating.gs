@@ -51,16 +51,6 @@ const CONFIG = {
     }
   },
 
-  ratingJobs: {
-    maxRetryRounds: {
-      pd: 1,
-      np: 1,
-      sz: 1
-    },
-    storagePrefix: 'rating_job_',
-    batchMaxRuntimeMs: 270000
-  },
-
   fetchOptions: {
     maxAttempts: 3,
     baseDelayMs: 1200,
@@ -244,16 +234,12 @@ function updateRatings_(aggregatorKeys) {
 
 function startRatingJob_(aggregatorKey) {
   createOrContinueRatingJob_(aggregatorKey);
-  processOneRatingJob_(aggregatorKey);
+  resumePendingRatingJobs();
 }
 
 function resumePendingRatingJobs() {
   var selected = selectPendingRatingJob_();
   if (!selected) {
-    var logSheet = getOrCreateLogSheet_();
-    var logs = [];
-    addLog_(logs, 'DEBUG', 'Нет незавершённых заданий рейтингов', {});
-    flushLogs_(logSheet, logs);
     return;
   }
   processOneRatingJob_(selected);
@@ -329,7 +315,10 @@ function createOrContinueRatingJob_(aggregatorKey) {
     total: 0,
     permanentErrors: 0,
     temporaryErrors: 0,
-    preservedPrevious: 0
+    preservedPrevious: 0,
+    retryQueueSnapshot: [],
+    retryQueuePosition: 0,
+    retryFailedIndexes: []
   };
   saveRatingJob_(aggregatorKey, job);
   return job;
@@ -402,29 +391,33 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
   targetData = getExistingTargetData_(targetSheet);
 
   job.total = sourceObjects.length;
+  job.retryQueueSnapshot = job.retryQueueSnapshot || [];
+  job.retryQueuePosition = Number(job.retryQueuePosition || 0);
+  job.retryFailedIndexes = job.retryFailedIndexes || [];
+
   var agg = CONFIG.aggregators[aggregatorKey];
   var columns = getAggregatorTargetColumns_(targetSheet, agg);
-  var startIndex = Number(job.nextSourceIndex) || 0;
-  var indexes = buildIndexesForCurrentStage_(job, sourceObjects.length);
-  var isRetryStage = Number(job.retryRound) > 0;
-  if (isRetryStage) {
-    job.failedIndexes = [];
-  }
+  var isRetryStage = (job.retryQueueSnapshot || []).length > 0;
+  var indexes = isRetryStage ? job.retryQueueSnapshot.slice() : buildIndexesForCurrentStage_(job, sourceObjects.length);
+  var startIndex = isRetryStage ? Number(job.retryQueuePosition || 0) : Number(job.nextSourceIndex || 0);
   var processedInRun = 0;
   var success = 0;
   var preserved = 0;
   var permanentErrors = 0;
   var temporaryErrors = 0;
   var batchLimit = CONFIG.ratingJobs.batchSize[aggregatorKey] || 10;
-  var nextPointer = startIndex;
-  var failedThisRound = [];
 
-  addLog_(ctx.logs, 'INFO', 'Старт порции обновления рейтингов', { runId: ctx.runId, date: job.date, aggregator: aggregatorKey, startIndex: startIndex, retryRound: job.retryRound });
+  addLog_(ctx.logs, 'INFO', 'Старт порции обновления рейтингов', { runId: ctx.runId, date: job.date, aggregator: aggregatorKey, startIndex: startIndex, retryRound: job.retryRound, retryStage: isRetryStage });
 
   for (var p = startIndex; p < indexes.length; p++) {
     if (!hasExecutionTime_(ctx, 12000) || processedInRun >= batchLimit) {
+      if (isRetryStage) {
+        var pausedState = buildRetryQueueState_(job.retryQueueSnapshot, job.retryQueuePosition, job.retryFailedIndexes, 'paused');
+        job.failedIndexes = pausedState.retryQueue;
+      } else {
+        job.nextSourceIndex = p;
+      }
       job.status = 'pending';
-      job.nextSourceIndex = p;
       job.updatedAt = new Date().toISOString();
       saveRatingJob_(aggregatorKey, job);
       addLog_(ctx.logs, 'INFO', 'Порция завершена, задание будет продолжено', buildRunStats_(ctx, job, startIndex, p, processedInRun, success, preserved, permanentErrors, temporaryErrors, 'time_or_batch_limit'));
@@ -435,9 +428,9 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
     var sourceRow = sourceObjects[sourceIndex];
     var rowNumber = sourceIndex + 2;
     var doctorName = normalizeText_(sourceRow[doctorHeader]);
-    nextPointer = p + 1;
     if (!doctorName) {
-      job.nextSourceIndex = nextPointer;
+      if (isRetryStage) job.retryQueuePosition = p + 1;
+      else job.nextSourceIndex = p + 1;
       saveRatingJob_(aggregatorKey, job);
       continue;
     }
@@ -446,11 +439,28 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
     if (!todayEntry) throw new Error('Не найдена строка текущего дня для врача: ' + doctorName);
     var url = normalizeUrl_(sourceRow[agg.sourceHeader]);
     var result = processAggregatorDoctor_(aggregatorKey, url, doctorName, rowNumber, decimalSeparator, ctx);
-    processedInRun++;
 
+    if (result.status === 'deferred') {
+      job.status = 'pending';
+      job.updatedAt = new Date().toISOString();
+      saveRatingJob_(aggregatorKey, job);
+      addLog_(ctx.logs, 'INFO', 'Недостаточно безопасного времени, врач отложен без ошибки', buildRunStats_(ctx, job, startIndex, p, processedInRun, success, preserved, permanentErrors, temporaryErrors, result.reason || 'deferred'));
+      return;
+    }
+
+    if (!hasExecutionTime_(ctx, 10000)) {
+      job.status = 'pending';
+      job.updatedAt = new Date().toISOString();
+      saveRatingJob_(aggregatorKey, job);
+      addLog_(ctx.logs, 'INFO', 'Недостаточно времени перед записью, врач будет повторён', buildRunStats_(ctx, job, startIndex, p, processedInRun, success, preserved, permanentErrors, temporaryErrors, 'write_time_limit'));
+      return;
+    }
+
+    processedInRun++;
     if (result.status === 'success') {
       writeAggregatorValues_(targetSheet, todayEntry.arrayIndex + 2, columns, result.values);
       success++;
+      ctx.consecutiveFullFailures = 0;
     } else if (result.status === 'empty') {
       preserved++;
     } else if (result.status === 'permanent') {
@@ -459,29 +469,35 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
     } else {
       temporaryErrors++;
       preserved++;
-      failedThisRound.push(sourceIndex);
+      if (isRetryStage) {
+        job.retryFailedIndexes = mergeUniqueIndexes_(job.retryFailedIndexes, [sourceIndex]);
+      } else {
+        job.failedIndexes = mergeUniqueIndexes_(job.failedIndexes, [sourceIndex]);
+      }
       if (aggregatorKey === 'pd') {
         ctx.consecutiveFullFailures++;
         if (ctx.consecutiveFullFailures >= CONFIG.ratingJobs.pd.consecutiveFullFailureLimit) {
           job.status = 'waiting_retry';
           job.retryAfter = new Date(Date.now() + CONFIG.ratingJobs.pd.retryCooldownMs).toISOString();
-          job.nextSourceIndex = nextPointer;
-          job.failedIndexes = mergeUniqueIndexes_(job.failedIndexes, failedThisRound);
+          if (isRetryStage) job.retryQueuePosition = p + 1;
+          else job.nextSourceIndex = p + 1;
           job.updatedAt = new Date().toISOString();
           saveRatingJob_(aggregatorKey, job);
-          addLog_(ctx.logs, 'WARN', 'Массовые технические ошибки ПД, задание поставлено на паузу', buildRunStats_(ctx, job, startIndex, nextPointer, processedInRun, success, preserved, permanentErrors, temporaryErrors, 'waiting_retry'));
+          addLog_(ctx.logs, 'WARN', 'Массовые технические ошибки ПД, задание поставлено на паузу', buildRunStats_(ctx, job, startIndex, p + 1, processedInRun, success, preserved, permanentErrors, temporaryErrors, 'waiting_retry'));
           return;
         }
       }
     }
-    if (result.status === 'success') ctx.consecutiveFullFailures = 0;
 
-    job.nextSourceIndex = nextPointer;
-    job.failedIndexes = isRetryStage ? failedThisRound.slice() : mergeUniqueIndexes_(job.failedIndexes, failedThisRound);
+    if (isRetryStage) job.retryQueuePosition = p + 1;
+    else job.nextSourceIndex = p + 1;
     job.processed = Math.max(Number(job.processed) || 0, sourceIndex + 1);
-    job.permanentErrors = permanentErrors;
-    job.temporaryErrors = temporaryErrors;
-    job.preservedPrevious = preserved;
+    job.permanentErrors = Number(job.permanentErrors || 0) + permanentErrors;
+    job.temporaryErrors = Number(job.temporaryErrors || 0) + temporaryErrors;
+    job.preservedPrevious = Number(job.preservedPrevious || 0) + preserved;
+    permanentErrors = 0;
+    temporaryErrors = 0;
+    preserved = 0;
     job.updatedAt = new Date().toISOString();
     saveRatingJob_(aggregatorKey, job);
 
@@ -490,9 +506,20 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
     }
   }
 
+  if (isRetryStage) {
+    var completedState = buildRetryQueueState_(job.retryQueueSnapshot, job.retryQueueSnapshot.length, job.retryFailedIndexes, 'round_completed');
+    job.failedIndexes = completedState.retryQueue;
+    job.retryQueueSnapshot = [];
+    job.retryQueuePosition = 0;
+    job.retryFailedIndexes = [];
+  }
+
   if (job.retryRound < (CONFIG.ratingJobs.maxRetryRounds[aggregatorKey] || 0) && (job.failedIndexes || []).length > 0) {
     job.retryRound = Number(job.retryRound) + 1;
-    job.nextSourceIndex = 0;
+    job.retryQueueSnapshot = job.failedIndexes.slice();
+    job.retryQueuePosition = 0;
+    job.retryFailedIndexes = [];
+    job.nextSourceIndex = sourceObjects.length;
     job.status = 'waiting_retry';
     job.retryAfter = new Date(Date.now() + (CONFIG.ratingJobs.retryCooldownMs || 900000)).toISOString();
     job.updatedAt = new Date().toISOString();
@@ -501,13 +528,18 @@ function processRatingJobBatch_(aggregatorKey, job, ctx) {
     return;
   }
 
-  job.status = (job.failedIndexes || []).length > 0 ? 'completed_with_errors' : 'completed';
-  job.nextSourceIndex = indexes.length;
+  if ((job.failedIndexes || []).length > 0) {
+    var limitState = buildRetryQueueState_(job.failedIndexes, job.failedIndexes.length, job.failedIndexes, 'round_limit_reached');
+    job.failedIndexes = limitState.retryQueue;
+    job.status = limitState.status;
+  } else {
+    job.status = 'completed';
+  }
+  job.nextSourceIndex = sourceObjects.length;
   job.updatedAt = new Date().toISOString();
   saveRatingJob_(aggregatorKey, job);
   addLog_(ctx.logs, 'INFO', 'Обновление агрегатора завершено', buildRunStats_(ctx, job, startIndex, indexes.length, processedInRun, success, preserved, permanentErrors, temporaryErrors, job.status));
 }
-
 
 function assertAggregatorKey_(key) {
   if (!CONFIG.aggregators[key]) throw new Error('Неизвестный агрегатор: ' + key);
@@ -530,6 +562,9 @@ function getRatingJob_(aggregatorKey) {
     date: all[prefix + 'date'] || '',
     nextSourceIndex: Number(all[prefix + 'nextSourceIndex'] || 0),
     failedIndexes: parseJsonArray_(all[prefix + 'failedIndexes']),
+    retryQueueSnapshot: parseJsonArray_(all[prefix + 'retryQueueSnapshot']),
+    retryQueuePosition: Number(all[prefix + 'retryQueuePosition'] || 0),
+    retryFailedIndexes: parseJsonArray_(all[prefix + 'retryFailedIndexes']),
     retryRound: Number(all[prefix + 'retryRound'] || 0),
     retryAfter: all[prefix + 'retryAfter'] || '',
     createdAt: all[prefix + 'createdAt'] || '',
@@ -642,6 +677,10 @@ function processAggregatorDoctor_(key, url, doctorName, rowNumber, decimalSepara
   }
   var fetched = key === 'pd' ? fetchPdHtml_(url, ctx) : (key === 'np' ? fetchNpHtml_(url, ctx) : fetchSzHtml_(url, ctx));
   if (!fetched.ok) {
+    if (isDeferredFetchResult_(fetched)) {
+      addLog_(ctx.logs, 'INFO', 'SAFE_TIME_LIMIT_NEAR — врач отложен без ошибки', { runId: ctx.runId, row: rowNumber, doctor: doctorName, aggregator: agg.title, url: url });
+      return { status: 'deferred', reason: 'SAFE_TIME_LIMIT_NEAR' };
+    }
     var level = fetched.permanent ? 'ERROR' : 'WARN';
     addLog_(ctx.logs, level, (fetched.permanent ? 'Постоянная ошибка — сохранены предыдущие значения' : 'Техническая ошибка — сохранены предыдущие значения'), { runId: ctx.runId, row: rowNumber, doctor: doctorName, aggregator: agg.title, url: url, status: fetched.statusCode || '', error: fetched.error || '', needCheckSourceUrl: fetched.statusCode === 404 });
     return { status: fetched.permanent ? 'permanent' : 'temporary' };
@@ -653,6 +692,37 @@ function processAggregatorDoctor_(key, url, doctorName, rowNumber, decimalSepara
   }
   addLog_(ctx.logs, 'INFO', 'Данные извлечены', { runId: ctx.runId, row: rowNumber, doctor: doctorName, aggregator: agg.title, url: url, method: fetched.method, attempt: fetched.attempt });
   return { status: 'success', values: { rating: parsed.rating ? formatRatingForLocale_(parsed.rating, decimalSeparator) : '', reviews: parsed.reviews || '', clinics: parsed.clinics || '' } };
+}
+
+
+function isDeferredFetchResult_(fetched) {
+  return !!(fetched && (fetched.deferred === true || fetched.error === 'SAFE_TIME_LIMIT_NEAR'));
+}
+
+function applyRatingJobDecision_(state, sourceIndex, result, isRetryStage) {
+  var next = {
+    nextSourceIndex: Number(state.nextSourceIndex || 0),
+    retryQueuePosition: Number(state.retryQueuePosition || 0),
+    failedIndexes: (state.failedIndexes || []).slice(),
+    retryFailedIndexes: (state.retryFailedIndexes || []).slice(),
+    processedInRun: Number(state.processedInRun || 0),
+    temporaryErrors: Number(state.temporaryErrors || 0),
+    permanentErrors: Number(state.permanentErrors || 0),
+    preservedPrevious: Number(state.preservedPrevious || 0),
+    status: state.status || 'running'
+  };
+  if (result && result.status === 'deferred') {
+    next.status = 'pending';
+    return next;
+  }
+  next.processedInRun++;
+  if (result && result.status === 'temporary') {
+    next.temporaryErrors++;
+    next.preservedPrevious++;
+    if (isRetryStage) next.retryFailedIndexes = mergeUniqueIndexes_(next.retryFailedIndexes, [sourceIndex]);
+    else next.failedIndexes = mergeUniqueIndexes_(next.failedIndexes, [sourceIndex]);
+  }
+  return next;
 }
 
 function isParsedResultValid_(key, html, parsed) {
@@ -1107,7 +1177,11 @@ function cleanJsonText_(value) {
    ========================= */
 
 function fetchHtml_(url) {
-  return fetchGenericHtml_(url, null).html;
+  var result = fetchGenericHtml_(url, null);
+  if (!result.ok) {
+    throw new Error(result.error || ('HTTP status: ' + result.statusCode));
+  }
+  return result.html;
 }
 
 function fetchNpHtml_(url, ctx) {
@@ -1122,7 +1196,7 @@ function fetchGenericHtml_(url, ctx, key, maxAttempts) {
   var attempts = Math.max(1, Number(maxAttempts || (CONFIG.fetchOptions && CONFIG.fetchOptions.maxAttempts) || 3));
   var last = { ok: false, statusCode: '', error: '' };
   for (var attempt = 1; attempt <= attempts; attempt++) {
-    if (ctx && !hasExecutionTime_(ctx, 10000)) return { ok: false, error: 'SAFE_TIME_LIMIT_NEAR', temporary: true };
+    if (ctx && !hasExecutionTime_(ctx, 10000)) return { ok: false, deferred: true, error: 'SAFE_TIME_LIMIT_NEAR' };
     try {
       var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, headers: buildFetchHeaders_() });
       var statusCode = response.getResponseCode();
@@ -1134,7 +1208,7 @@ function fetchGenericHtml_(url, ctx, key, maxAttempts) {
       if (attempt >= attempts) return last;
     }
     var delay = Math.min(CONFIG.fetchOptions.maxDelayMs, CONFIG.fetchOptions.baseDelayMs * Math.pow(2, attempt - 1)) + randomInt_(0, CONFIG.fetchOptions.jitterMs);
-    if (ctx && !hasExecutionTime_(ctx, delay + 8000)) return { ok: false, error: 'SAFE_TIME_LIMIT_NEAR', temporary: true };
+    if (ctx && !hasExecutionTime_(ctx, delay + 8000)) return { ok: false, deferred: true, error: 'SAFE_TIME_LIMIT_NEAR' };
     sleepMs_(delay);
   }
   return last;
@@ -1144,7 +1218,7 @@ function fetchPdHtml_(url, ctx) {
   var pdConfig = CONFIG.ratingJobs.pd;
   var last = { ok: false, statusCode: '', error: '' };
   if (!ctx.directDisabled) {
-    if (!hasExecutionTime_(ctx, 12000)) return { ok: false, error: 'SAFE_TIME_LIMIT_NEAR' };
+    if (!hasExecutionTime_(ctx, 12000)) return { ok: false, deferred: true, error: 'SAFE_TIME_LIMIT_NEAR' };
     try {
       var direct = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, headers: buildFetchHeaders_() });
       var directStatus = direct.getResponseCode();
@@ -1179,10 +1253,10 @@ function fetchPdHtml_(url, ctx) {
   for (var i = 0; i < maxReserve; i++) {
     var delay = i === 0 ? 0 : (i === 1 ? randomInt_(4000, 6000) : randomInt_(8000, 12000));
     if (delay > 0) {
-      if (!hasExecutionTime_(ctx, delay + 12000)) return { ok: false, error: 'SAFE_TIME_LIMIT_NEAR' };
+      if (!hasExecutionTime_(ctx, delay + 12000)) return { ok: false, deferred: true, error: 'SAFE_TIME_LIMIT_NEAR' };
       sleepMs_(delay);
     }
-    if (!hasExecutionTime_(ctx, 12000)) return { ok: false, error: 'SAFE_TIME_LIMIT_NEAR' };
+    if (!hasExecutionTime_(ctx, 12000)) return { ok: false, deferred: true, error: 'SAFE_TIME_LIMIT_NEAR' };
     try {
       var reserve = reserves[i];
       var response = UrlFetchApp.fetch(reserve.url, { muteHttpExceptions: true, followRedirects: true, headers: buildFetchHeaders_() });
@@ -1608,157 +1682,6 @@ function getHeaderIndexes_(sheet, requiredHeaders) {
   }
 
   return indexes;
-}
-
-/* =========================
-   Фоновые задания рейтингов
-   ========================= */
-
-function processRatingJobBatch_(jobId) {
-  var job = getRatingJob_(jobId);
-  if (!job) {
-    throw new Error('Задание рейтингов не найдено: ' + jobId);
-  }
-
-  var aggregatorKey = job.aggregatorKey;
-  var maxRetryRounds = getMaxRetryRounds_(aggregatorKey);
-  var retryQueue = job.retryQueueSnapshot || job.failedIndexes || [];
-  var retryPosition = Number(job.retryQueuePosition || 0);
-  var retryFailedIndexes = job.retryFailedIndexes || [];
-  var startedAt = Date.now();
-  var maxRuntimeMs = Number(job.batchMaxRuntimeMs || CONFIG.ratingJobs.batchMaxRuntimeMs);
-
-  if (!retryQueue.length) {
-    job.status = 'completed';
-    job.failedIndexes = [];
-    clearRetryRoundState_(job);
-    saveRatingJob_(job);
-    return job;
-  }
-
-  job.retryQueueSnapshot = retryQueue.slice();
-  job.retryQueuePosition = retryPosition;
-  job.retryFailedIndexes = retryFailedIndexes.slice();
-  job.status = 'retrying';
-
-  for (var i = retryPosition; i < retryQueue.length; i++) {
-    if (shouldStopRatingJobBatch_(startedAt, maxRuntimeMs)) {
-      savePausedRetryRound_(job, retryQueue, i, retryFailedIndexes);
-      return job;
-    }
-
-    var sourceIndex = retryQueue[i];
-    job.retryQueuePosition = i;
-
-    try {
-      processRatingJobItem_(job, sourceIndex);
-    } catch (error) {
-      retryFailedIndexes.push(sourceIndex);
-      job.lastError = error && error.message ? error.message : String(error);
-    }
-
-    if (shouldStopRatingJobBatch_(startedAt, maxRuntimeMs)) {
-      savePausedRetryRound_(job, retryQueue, i + 1, retryFailedIndexes);
-      return job;
-    }
-  }
-
-  job.failedIndexes = uniqueIndexes_(retryFailedIndexes);
-  job.retryRound = Number(job.retryRound || 0) + 1;
-  clearRetryRoundState_(job);
-
-  if (job.failedIndexes.length && job.retryRound >= maxRetryRounds) {
-    job.status = 'completed_with_errors';
-  } else if (job.failedIndexes.length) {
-    job.status = 'pending_retry';
-  } else {
-    job.status = 'completed';
-  }
-
-  saveRatingJob_(job);
-  return job;
-}
-
-function getRatingJob_(jobId) {
-  var raw = PropertiesService.getScriptProperties().getProperty(CONFIG.ratingJobs.storagePrefix + jobId);
-  if (!raw) {
-    return null;
-  }
-
-  var job = JSON.parse(raw);
-  job.failedIndexes = job.failedIndexes || [];
-  job.retryQueueSnapshot = job.retryQueueSnapshot || null;
-  job.retryQueuePosition = Number(job.retryQueuePosition || 0);
-  job.retryFailedIndexes = job.retryFailedIndexes || [];
-
-  return job;
-}
-
-function saveRatingJob_(job) {
-  if (!job || !job.id) {
-    throw new Error('Нельзя сохранить задание рейтингов без id');
-  }
-
-  var payload = {
-    id: job.id,
-    status: job.status,
-    aggregatorKey: job.aggregatorKey,
-    retryRound: Number(job.retryRound || 0),
-    failedIndexes: job.failedIndexes || [],
-    retryQueueSnapshot: job.retryQueueSnapshot || null,
-    retryQueuePosition: Number(job.retryQueuePosition || 0),
-    retryFailedIndexes: job.retryFailedIndexes || [],
-    batchMaxRuntimeMs: job.batchMaxRuntimeMs || null,
-    lastError: job.lastError || ''
-  };
-
-  PropertiesService
-    .getScriptProperties()
-    .setProperty(CONFIG.ratingJobs.storagePrefix + job.id, JSON.stringify(payload));
-}
-
-function savePausedRetryRound_(job, retryQueue, nextPosition, retryFailedIndexes) {
-  var remainingIndexes = retryQueue.slice(nextPosition);
-
-  job.failedIndexes = uniqueIndexes_(retryFailedIndexes.concat(remainingIndexes));
-  job.retryFailedIndexes = uniqueIndexes_(retryFailedIndexes);
-  job.retryQueueSnapshot = retryQueue.slice();
-  job.retryQueuePosition = nextPosition;
-  job.status = 'pending_retry';
-
-  saveRatingJob_(job);
-}
-
-function clearRetryRoundState_(job) {
-  job.retryQueueSnapshot = null;
-  job.retryQueuePosition = 0;
-  job.retryFailedIndexes = [];
-}
-
-function shouldStopRatingJobBatch_(startedAt, maxRuntimeMs) {
-  return Date.now() - startedAt >= maxRuntimeMs;
-}
-
-function getMaxRetryRounds_(aggregatorKey) {
-  var maxRetryRounds = CONFIG.ratingJobs.maxRetryRounds || {};
-  return Number(maxRetryRounds[aggregatorKey] || 0);
-}
-
-function uniqueIndexes_(indexes) {
-  var seen = {};
-  var result = [];
-
-  for (var i = 0; i < indexes.length; i++) {
-    var index = Number(indexes[i]);
-    if (isNaN(index) || seen[index]) {
-      continue;
-    }
-
-    seen[index] = true;
-    result.push(index);
-  }
-
-  return result;
 }
 
 /* =========================
