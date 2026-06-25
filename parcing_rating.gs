@@ -51,6 +51,16 @@ const CONFIG = {
     }
   },
 
+  ratingJobs: {
+    maxRetryRounds: {
+      pd: 1,
+      np: 1,
+      sz: 1
+    },
+    storagePrefix: 'rating_job_',
+    batchMaxRuntimeMs: 270000
+  },
+
   fetchOptions: {
     maxAttempts: 3,
     baseDelayMs: 1200,
@@ -1598,6 +1608,157 @@ function getHeaderIndexes_(sheet, requiredHeaders) {
   }
 
   return indexes;
+}
+
+/* =========================
+   Фоновые задания рейтингов
+   ========================= */
+
+function processRatingJobBatch_(jobId) {
+  var job = getRatingJob_(jobId);
+  if (!job) {
+    throw new Error('Задание рейтингов не найдено: ' + jobId);
+  }
+
+  var aggregatorKey = job.aggregatorKey;
+  var maxRetryRounds = getMaxRetryRounds_(aggregatorKey);
+  var retryQueue = job.retryQueueSnapshot || job.failedIndexes || [];
+  var retryPosition = Number(job.retryQueuePosition || 0);
+  var retryFailedIndexes = job.retryFailedIndexes || [];
+  var startedAt = Date.now();
+  var maxRuntimeMs = Number(job.batchMaxRuntimeMs || CONFIG.ratingJobs.batchMaxRuntimeMs);
+
+  if (!retryQueue.length) {
+    job.status = 'completed';
+    job.failedIndexes = [];
+    clearRetryRoundState_(job);
+    saveRatingJob_(job);
+    return job;
+  }
+
+  job.retryQueueSnapshot = retryQueue.slice();
+  job.retryQueuePosition = retryPosition;
+  job.retryFailedIndexes = retryFailedIndexes.slice();
+  job.status = 'retrying';
+
+  for (var i = retryPosition; i < retryQueue.length; i++) {
+    if (shouldStopRatingJobBatch_(startedAt, maxRuntimeMs)) {
+      savePausedRetryRound_(job, retryQueue, i, retryFailedIndexes);
+      return job;
+    }
+
+    var sourceIndex = retryQueue[i];
+    job.retryQueuePosition = i;
+
+    try {
+      processRatingJobItem_(job, sourceIndex);
+    } catch (error) {
+      retryFailedIndexes.push(sourceIndex);
+      job.lastError = error && error.message ? error.message : String(error);
+    }
+
+    if (shouldStopRatingJobBatch_(startedAt, maxRuntimeMs)) {
+      savePausedRetryRound_(job, retryQueue, i + 1, retryFailedIndexes);
+      return job;
+    }
+  }
+
+  job.failedIndexes = uniqueIndexes_(retryFailedIndexes);
+  job.retryRound = Number(job.retryRound || 0) + 1;
+  clearRetryRoundState_(job);
+
+  if (job.failedIndexes.length && job.retryRound >= maxRetryRounds) {
+    job.status = 'completed_with_errors';
+  } else if (job.failedIndexes.length) {
+    job.status = 'pending_retry';
+  } else {
+    job.status = 'completed';
+  }
+
+  saveRatingJob_(job);
+  return job;
+}
+
+function getRatingJob_(jobId) {
+  var raw = PropertiesService.getScriptProperties().getProperty(CONFIG.ratingJobs.storagePrefix + jobId);
+  if (!raw) {
+    return null;
+  }
+
+  var job = JSON.parse(raw);
+  job.failedIndexes = job.failedIndexes || [];
+  job.retryQueueSnapshot = job.retryQueueSnapshot || null;
+  job.retryQueuePosition = Number(job.retryQueuePosition || 0);
+  job.retryFailedIndexes = job.retryFailedIndexes || [];
+
+  return job;
+}
+
+function saveRatingJob_(job) {
+  if (!job || !job.id) {
+    throw new Error('Нельзя сохранить задание рейтингов без id');
+  }
+
+  var payload = {
+    id: job.id,
+    status: job.status,
+    aggregatorKey: job.aggregatorKey,
+    retryRound: Number(job.retryRound || 0),
+    failedIndexes: job.failedIndexes || [],
+    retryQueueSnapshot: job.retryQueueSnapshot || null,
+    retryQueuePosition: Number(job.retryQueuePosition || 0),
+    retryFailedIndexes: job.retryFailedIndexes || [],
+    batchMaxRuntimeMs: job.batchMaxRuntimeMs || null,
+    lastError: job.lastError || ''
+  };
+
+  PropertiesService
+    .getScriptProperties()
+    .setProperty(CONFIG.ratingJobs.storagePrefix + job.id, JSON.stringify(payload));
+}
+
+function savePausedRetryRound_(job, retryQueue, nextPosition, retryFailedIndexes) {
+  var remainingIndexes = retryQueue.slice(nextPosition);
+
+  job.failedIndexes = uniqueIndexes_(retryFailedIndexes.concat(remainingIndexes));
+  job.retryFailedIndexes = uniqueIndexes_(retryFailedIndexes);
+  job.retryQueueSnapshot = retryQueue.slice();
+  job.retryQueuePosition = nextPosition;
+  job.status = 'pending_retry';
+
+  saveRatingJob_(job);
+}
+
+function clearRetryRoundState_(job) {
+  job.retryQueueSnapshot = null;
+  job.retryQueuePosition = 0;
+  job.retryFailedIndexes = [];
+}
+
+function shouldStopRatingJobBatch_(startedAt, maxRuntimeMs) {
+  return Date.now() - startedAt >= maxRuntimeMs;
+}
+
+function getMaxRetryRounds_(aggregatorKey) {
+  var maxRetryRounds = CONFIG.ratingJobs.maxRetryRounds || {};
+  return Number(maxRetryRounds[aggregatorKey] || 0);
+}
+
+function uniqueIndexes_(indexes) {
+  var seen = {};
+  var result = [];
+
+  for (var i = 0; i < indexes.length; i++) {
+    var index = Number(indexes[i]);
+    if (isNaN(index) || seen[index]) {
+      continue;
+    }
+
+    seen[index] = true;
+    result.push(index);
+  }
+
+  return result;
 }
 
 /* =========================
